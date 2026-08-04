@@ -1,0 +1,106 @@
+name: Measure Runner Space
+
+on:
+  workflow_dispatch:
+    inputs:
+      do_cleanup:
+        description: "Run the cleanup step"
+        type: boolean
+        default: true
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    steps:
+      - name: System info (OS/kernel)
+        run: |
+          echo "== uname ==" 
+          uname -a
+          echo "== os-release =="
+          cat /etc/os-release
+
+      - name: Measure BEFORE cleanup
+        run: |
+          echo "### DISK (before) ###" | tee -a $GITHUB_STEP_SUMMARY
+          df -h / | tee -a $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### RAM (before) ###" | tee -a $GITHUB_STEP_SUMMARY
+          free -h | tee -a $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Save numeric root-avail (in KB) for later diffing
+          df --output=avail -k / | tail -1 | tr -d ' ' > /tmp/avail_before.txt
+          free -m | awk '/^Mem:/{print $2}' > /tmp/ram_before.txt
+
+          echo "### Top 20 largest top-level dirs (before) ###" | tee -a $GITHUB_STEP_SUMMARY
+          sudo du -x -d 2 / 2>/dev/null | sort -rn | head -20 | tee -a $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup preinstalled bloat
+        if: ${{ inputs.do_cleanup }}
+        run: |
+          set -x
+          BEFORE=$(df --output=avail -k / | tail -1 | tr -d ' ')
+
+          # Language runtimes / SDKs most people don't need
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/local/share/chromium
+          sudo rm -rf /usr/local/lib/node_modules
+          sudo rm -rf /usr/share/swift
+
+          # Hosted tool cache (Go/Python/Node/Ruby versions you didn't ask for)
+          sudo rm -rf /opt/hostedtoolcache
+
+          # Browsers (Chrome/Firefox/Edge etc. pulled in for Selenium-type jobs)
+          sudo rm -rf /usr/local/share/edge_driver
+          sudo rm -rf /usr/local/share/gecko_driver
+          sudo apt-get remove -y '^google-chrome.*' '^firefox.*' '^microsoft-edge.*' 2>/dev/null || true
+
+          # Docker images preloaded on the runner
+          docker image prune -af || true
+          docker builder prune -af || true
+
+          # apt caches
+          sudo apt-get clean
+          sudo apt-get autoremove -y
+
+          AFTER=$(df --output=avail -k / | tail -1 | tr -d ' ')
+          FREED_KB=$((AFTER - BEFORE))
+          echo "Freed: $((FREED_KB / 1024)) MB" | tee -a $GITHUB_STEP_SUMMARY
+
+      - name: Measure AFTER cleanup
+        run: |
+          echo "### DISK (after) ###" | tee -a $GITHUB_STEP_SUMMARY
+          df -h / | tee -a $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### RAM (after) ###" | tee -a $GITHUB_STEP_SUMMARY
+          free -h | tee -a $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          df --output=avail -k / | tail -1 | tr -d ' ' > /tmp/avail_after.txt
+          free -m | awk '/^Mem:/{print $2}' > /tmp/ram_after.txt
+
+          echo "### Top 20 largest top-level dirs (after) ###" | tee -a $GITHUB_STEP_SUMMARY
+          sudo du -x -d 2 / 2>/dev/null | sort -rn | head -20 | tee -a $GITHUB_STEP_SUMMARY
+
+      - name: Summarize diff
+        run: |
+          BEFORE_KB=$(cat /tmp/avail_before.txt)
+          AFTER_KB=$(cat /tmp/avail_after.txt)
+          DIFF_MB=$(( (AFTER_KB - BEFORE_KB) / 1024 ))
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Free disk before: $((BEFORE_KB / 1024)) MB" >> $GITHUB_STEP_SUMMARY
+          echo "- Free disk after:  $((AFTER_KB / 1024)) MB" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reclaimed: ${DIFF_MB} MB**" >> $GITHUB_STEP_SUMMARY
+
+          RAM_BEFORE=$(cat /tmp/ram_before.txt)
+          RAM_AFTER=$(cat /tmp/ram_after.txt)
+          echo "- Total RAM before: ${RAM_BEFORE} MB" >> $GITHUB_STEP_SUMMARY
+          echo "- Total RAM after:  ${RAM_AFTER} MB" >> $GITHUB_STEP_SUMMARY
+          echo "(Note: total installed RAM doesn't change from disk cleanup — this just confirms the runner spec.)" >> $GITHUB_STEP_SUMMARY
