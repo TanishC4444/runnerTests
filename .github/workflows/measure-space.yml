@@ -1,15 +1,25 @@
-name: Measure Runner Space
+name: Measure Runner Space & Hardware
 
 on:
   workflow_dispatch:
     inputs:
       do_cleanup:
-        description: "Run the cleanup step"
+        description: "Run the disk cleanup step"
         type: boolean
         default: true
+      model_size_gb_quantized:
+        description: "Model size in GB, quantized (for VRAM sizing check)"
+        type: string
+        default: "40"
+      model_size_gb_unquantized:
+        description: "Model size in GB, unquantized/fp16 (for ideal VRAM check)"
+        type: string
+        default: "140"
 
 jobs:
   measure:
+    # Swap to your self-hosted GPU runner label to get real GPU/NVLink/InfiniBand numbers.
+    # ubuntu-latest will run this fine but every GPU/interconnect field will read "N/A".
     runs-on: ubuntu-latest
     steps:
       - name: System info (OS/kernel)
@@ -19,7 +29,10 @@ jobs:
           echo "== os-release =="
           cat /etc/os-release
 
-      - name: Measure BEFORE cleanup
+      # ---------------------------------------------------------------------
+      # DISK / RAM (original cleanup measurement)
+      # ---------------------------------------------------------------------
+      - name: Measure disk/RAM BEFORE cleanup
         run: |
           echo "### DISK (before) ###" | tee -a $GITHUB_STEP_SUMMARY
           df -h / | tee -a $GITHUB_STEP_SUMMARY
@@ -28,7 +41,6 @@ jobs:
           free -h | tee -a $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          # Save numeric root-avail (in KB) for later diffing
           df --output=avail -k / | tail -1 | tr -d ' ' > /tmp/avail_before.txt
           free -m | awk '/^Mem:/{print $2}' > /tmp/ram_before.txt
 
@@ -41,7 +53,6 @@ jobs:
           set -x
           BEFORE=$(df --output=avail -k / | tail -1 | tr -d ' ')
 
-          # Language runtimes / SDKs most people don't need
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
@@ -51,20 +62,14 @@ jobs:
           sudo rm -rf /usr/local/share/chromium
           sudo rm -rf /usr/local/lib/node_modules
           sudo rm -rf /usr/share/swift
-
-          # Hosted tool cache (Go/Python/Node/Ruby versions you didn't ask for)
           sudo rm -rf /opt/hostedtoolcache
-
-          # Browsers (Chrome/Firefox/Edge etc. pulled in for Selenium-type jobs)
           sudo rm -rf /usr/local/share/edge_driver
           sudo rm -rf /usr/local/share/gecko_driver
           sudo apt-get remove -y '^google-chrome.*' '^firefox.*' '^microsoft-edge.*' 2>/dev/null || true
 
-          # Docker images preloaded on the runner
           docker image prune -af || true
           docker builder prune -af || true
 
-          # apt caches
           sudo apt-get clean
           sudo apt-get autoremove -y
 
@@ -72,7 +77,7 @@ jobs:
           FREED_KB=$((AFTER - BEFORE))
           echo "Freed: $((FREED_KB / 1024)) MB" | tee -a $GITHUB_STEP_SUMMARY
 
-      - name: Measure AFTER cleanup
+      - name: Measure disk/RAM AFTER cleanup
         run: |
           echo "### DISK (after) ###" | tee -a $GITHUB_STEP_SUMMARY
           df -h / | tee -a $GITHUB_STEP_SUMMARY
@@ -87,14 +92,14 @@ jobs:
           echo "### Top 20 largest top-level dirs (after) ###" | tee -a $GITHUB_STEP_SUMMARY
           sudo du -x -d 2 / 2>/dev/null | sort -rn | head -20 | tee -a $GITHUB_STEP_SUMMARY
 
-      - name: Summarize diff
+      - name: Summarize disk/RAM diff
         run: |
           BEFORE_KB=$(cat /tmp/avail_before.txt)
           AFTER_KB=$(cat /tmp/avail_after.txt)
           DIFF_MB=$(( (AFTER_KB - BEFORE_KB) / 1024 ))
 
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## Disk/RAM Cleanup Summary" >> $GITHUB_STEP_SUMMARY
           echo "- Free disk before: $((BEFORE_KB / 1024)) MB" >> $GITHUB_STEP_SUMMARY
           echo "- Free disk after:  $((AFTER_KB / 1024)) MB" >> $GITHUB_STEP_SUMMARY
           echo "- **Reclaimed: ${DIFF_MB} MB**" >> $GITHUB_STEP_SUMMARY
@@ -103,4 +108,126 @@ jobs:
           RAM_AFTER=$(cat /tmp/ram_after.txt)
           echo "- Total RAM before: ${RAM_BEFORE} MB" >> $GITHUB_STEP_SUMMARY
           echo "- Total RAM after:  ${RAM_AFTER} MB" >> $GITHUB_STEP_SUMMARY
-          echo "(Note: total installed RAM doesn't change from disk cleanup — this just confirms the runner spec.)" >> $GITHUB_STEP_SUMMARY
+
+      # ---------------------------------------------------------------------
+      # ML CLUSTER HARDWARE SIZING CHECK
+      # Only meaningful on self-hosted GPU runners. On ubuntu-latest this
+      # section will report "N/A" for everything GPU-related, which is
+      # itself a useful signal (confirms you're not on real hardware).
+      # ---------------------------------------------------------------------
+      - name: Gather GPU / VRAM info
+        run: |
+          echo "## GPU / VRAM" >> $GITHUB_STEP_SUMMARY
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free \
+              --format=csv >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+
+            TOTAL_VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | \
+              awk '{s+=$1} END {print s}')
+            echo "TOTAL_VRAM_GB=$((TOTAL_VRAM_MB / 1024))" >> $GITHUB_ENV
+          else
+            echo "No NVIDIA GPU detected (nvidia-smi not found)." >> $GITHUB_STEP_SUMMARY
+            echo "TOTAL_VRAM_GB=0" >> $GITHUB_ENV
+          fi
+
+      - name: Gather inter-GPU link info (NVLink / PCIe)
+        run: |
+          echo "## Inter-GPU Link" >> $GITHUB_STEP_SUMMARY
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo "### NVLink status" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            nvidia-smi nvlink -s >> $GITHUB_STEP_SUMMARY 2>&1 || echo "No NVLink links found (likely PCIe-only)." >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+
+            echo "### PCIe link speed/width per GPU" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            nvidia-smi --query-gpu=index,pcie.link.gen.current,pcie.link.width.current \
+              --format=csv >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No GPU present, no inter-GPU link to measure." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Gather System RAM info
+        run: |
+          echo "## System RAM" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          free -h >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
+          echo "SYSTEM_RAM_GB=$RAM_GB" >> $GITHUB_ENV
+
+      - name: Gather Node Network info
+        run: |
+          echo "## Node Network" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          for IFACE in $(ls /sys/class/net | grep -v lo); do
+            SPEED=$(cat /sys/class/net/$IFACE/speed 2>/dev/null || echo "unknown")
+            echo "$IFACE: ${SPEED} Mb/s" >> $GITHUB_STEP_SUMMARY
+          done
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+          echo "### InfiniBand devices (if any)" >> $GITHUB_STEP_SUMMARY
+          if command -v ibstat >/dev/null 2>&1; then
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            ibstat >> $GITHUB_STEP_SUMMARY 2>&1
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "ibstat not found — no InfiniBand stack installed." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Gather PCIe lane / topology info
+        run: |
+          echo "## PCIe Lanes / Topology" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          if command -v lspci >/dev/null 2>&1; then
+            lspci -vv 2>/dev/null | grep -E "^[0-9a-f]{2}:|LnkCap:|LnkSta:" >> $GITHUB_STEP_SUMMARY || \
+              echo "lspci ran but no link capability data (likely no root permission or virtualized PCIe)." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "lspci not available." >> $GITHUB_STEP_SUMMARY
+          fi
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo "### nvidia-smi topology matrix (shows NVLink vs PCIe vs cross-CPU paths)" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            nvidia-smi topo -m >> $GITHUB_STEP_SUMMARY 2>&1
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Score against sizing table
+        run: |
+          MODEL_Q="${{ inputs.model_size_gb_quantized }}"
+          MODEL_FP="${{ inputs.model_size_gb_unquantized }}"
+          TOTAL_VRAM_GB="${TOTAL_VRAM_GB:-0}"
+          SYSTEM_RAM_GB="${SYSTEM_RAM_GB:-0}"
+
+          MIN_RAM=$MODEL_FP
+          IDEAL_RAM_LOW=$((MODEL_FP * 2))
+          IDEAL_RAM_HIGH=$((MODEL_FP * 3))
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Sizing Check vs. Reference Table" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Minimum (Basic Sharding) | Ideal (Production/Multi-GPU) | Detected | Verdict |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|---|---|---|" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$TOTAL_VRAM_GB" -ge "$MODEL_FP" ]; then VRAM_VERDICT="meets ideal"; \
+          elif [ "$TOTAL_VRAM_GB" -ge "$MODEL_Q" ]; then VRAM_VERDICT="meets minimum only"; \
+          else VRAM_VERDICT="below minimum"; fi
+          echo "| GPU VRAM Total | Fits quantized (${MODEL_Q}GB) | Fits unquantized (${MODEL_FP}GB) + KV cache | ${TOTAL_VRAM_GB}GB | $VRAM_VERDICT |" >> $GITHUB_STEP_SUMMARY
+
+          echo "| Inter-GPU Link | PCIe Gen4 x16 (~31.5 GB/s) | NVLink/NVSwitch (900-1800 GB/s) | see nvidia-smi topo above | manual review |" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$SYSTEM_RAM_GB" -ge "$IDEAL_RAM_LOW" ]; then RAM_VERDICT="meets ideal"; \
+          elif [ "$SYSTEM_RAM_GB" -ge "$MIN_RAM" ]; then RAM_VERDICT="meets minimum only"; \
+          else RAM_VERDICT="below minimum"; fi
+          echo "| System RAM | = model size (${MIN_RAM}GB) | 2x-3x model size (${IDEAL_RAM_LOW}-${IDEAL_RAM_HIGH}GB) | ${SYSTEM_RAM_GB}GB | $RAM_VERDICT |" >> $GITHUB_STEP_SUMMARY
+
+          echo "| Node Network | 25-100 Gbps Ethernet | 400 Gbps InfiniBand + GPUDirect | see interface list above | manual review |" >> $GITHUB_STEP_SUMMARY
+          echo "| PCIe Lanes | x16 per card | Direct CPU/PCIe switch topology | see lspci/topo output above | manual review |" >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "_VRAM and RAM rows are auto-scored against the model sizes you passed in._" >> $GITHUB_STEP_SUMMARY
+          echo "_Interconnect/network/PCIe rows need eyeballing the raw output above -- they're topology facts, not single numbers._" >> $GITHUB_STEP_SUMMARY
