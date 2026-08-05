@@ -1,23 +1,19 @@
 name: Qwen Chunk Watcher
-
 # Triggered manually (via API/token) once, at the start of a session.
 # NOT triggered per-chunk — one runner stays alive and works through
 # every chunk sequentially via its own poll loop.
 on:
   workflow_dispatch: {}
-
 jobs:
   watch:
     runs-on: ubuntu-latest
     timeout-minutes: 350   # stay under the 360min (6h) hard cap
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           # PAT stored as a repo secret, never hardcoded
           token: ${{ secrets.RUNNER_PAT }}
-
       - name: Install Ollama
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
@@ -27,24 +23,26 @@ jobs:
             curl -sf http://localhost:11434/api/tags && break
             sleep 1
           done
-
       - name: Cache Ollama models
+        id: cache-ollama
         uses: actions/cache@v4
         with:
           path: ~/.ollama/models
           key: ollama-qwen2.5-3b-v1
-
-      - name: Pull Qwen 2.5 3B
-        run: ollama pull qwen2.5:3b
-
+      - name: Pull Qwen 2.5 3B (skip if already cached)
+        run: |
+          if ollama list | grep -q "qwen2.5:3b"; then
+            echo "qwen2.5:3b already present from cache restore, skipping download."
+          else
+            echo "Not found in restored cache, pulling..."
+            ollama pull qwen2.5:3b
+          fi
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install Python deps
         run: pip install requests gTTS
-
       - name: Run watcher loop
         env:
           GH_TOKEN: ${{ secrets.RUNNER_PAT }}

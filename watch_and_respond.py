@@ -9,6 +9,15 @@ cost API-rate-limit budget), and for every new entry:
      in the JSON so it survives as one file — no binary blobs to juggle)
   4. commits the updated file back to the repo
 
+On startup, once Ollama/the model are actually confirmed reachable, it
+also pushes a short verbal "ready" cue to a separate status.json (see
+STATUS_FILE below) so the local side (run_all.py) can play it and only
+start listening once Qwen is genuinely ready -- rather than guessing.
+status.json is kept separate from chunks.json on purpose: chunks.json is
+already being written independently by the local listener, and mixing a
+second, differently-shaped writer into that file would just recreate the
+same race condition run_all.py/live_split_on_pauses.py had to work around.
+
 Stops only when the job is cancelled (by you, via the cancel-run API) or
 the workflow's own timeout is hit.
 """
@@ -25,7 +34,9 @@ from gtts import gTTS
 TOKEN = os.environ["GH_TOKEN"]
 REPO = os.environ["GITHUB_REPOSITORY"]  # "owner/repo"
 FILE_PATH = "chat/Log 1/chunks.json"
+STATUS_FILE = "chat/Log 1/status.json"
 API_URL = f"https://api.github.com/repos/{REPO}/contents/{FILE_PATH}"
+STATUS_API_URL = f"https://api.github.com/repos/{REPO}/contents/{STATUS_FILE}"
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "qwen2.5:3b"
@@ -86,8 +97,58 @@ def tts_base64(text: str) -> str:
         return base64.b64encode(f.read()).decode("utf-8")
 
 
+def fetch_status():
+    """Returns (payload_dict, sha). payload/sha are (None, None) if the
+    file doesn't exist yet (first run in this repo)."""
+    resp = requests.get(STATUS_API_URL, headers=gh_headers())
+    if resp.status_code == 404:
+        return None, None
+    resp.raise_for_status()
+    data = resp.json()
+    content = base64.b64decode(data["content"]).decode("utf-8")
+    payload = json.loads(content) if content.strip() else {}
+    return payload, data["sha"]
+
+
+def push_status(payload: dict, message: str):
+    _, sha = fetch_status()
+    body = {
+        "message": message,
+        "content": base64.b64encode(json.dumps(payload, indent=2).encode("utf-8")).decode("utf-8"),
+    }
+    if sha:
+        body["sha"] = sha
+    resp = requests.put(STATUS_API_URL, headers=gh_headers(), json=body)
+    resp.raise_for_status()
+
+
+def announce_ready():
+    """Verbal cue: TTS a short line and push it to status.json. Called
+    once Ollama has actually answered a prompt, so "ready" means the
+    model is genuinely warmed up and not just that the process started."""
+    try:
+        # a cheap real call, not just a health check -- confirms the
+        # model is loaded and generating, not just that the server is up
+        ask_qwen("Say 'ready' and nothing else.")
+        audio_b64 = tts_base64("I'm ready, go ahead.")
+    except Exception as e:
+        print(f"[ready] warm-up call failed, pushing text-only ready signal: {e}")
+        audio_b64 = None
+
+    push_status(
+        {
+            "ready": True,
+            "ready_audio_b64": audio_b64,
+            "ready_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        },
+        "Qwen watcher ready",
+    )
+    print("[ready] pushed verbal ready signal to status.json.")
+
+
 def main():
     print(f"Watching {FILE_PATH} in {REPO}, polling every {POLL_SECONDS}s...")
+    announce_ready()
 
     etag = None
     last_seen_count = None

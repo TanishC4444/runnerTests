@@ -30,6 +30,16 @@ Each printed chunk shows:
 Each chunk is also appended live to:
   chat/Log 1/chunks.json
 as {"datetime": ..., "talk_seconds": ..., "text": ..., "raw_text": ...}
+
+NOTE ON SYNCING: the cloud watcher (watch_and_respond.py) writes to this
+same file independently, via the GitHub Contents API, adding "response" /
+"response_audio_b64" fields to entries after the fact. That means two
+things: (1) a plain `git push` here can get rejected as non-fast-forward
+whenever the cloud side has pushed in between, and (2) even after a pull,
+writing from a stale in-memory `entries` list would silently clobber
+whatever the cloud side just added. So before every write we pull AND
+reload from disk, and if the push still gets rejected we pull-rebase and
+retry rather than giving up.
 """
 
 import json
@@ -59,6 +69,8 @@ SHOW_PARTIAL_PREVIEW = True        # set False if your terminal/log doesn't hand
 LOG_DIR = os.path.join("chat", "Log 1")
 LOG_FILE = os.path.join(LOG_DIR, "chunks.json")
 
+PUSH_RETRIES = 3
+
 
 def fmt(seconds: float) -> str:
     return f"{seconds:6.2f}s"
@@ -87,10 +99,26 @@ def save_log(entries: list):
         json.dump(entries, f, indent=2)
 
 
-def git_push_log():
+def git_pull_log():
+    """Pull remote changes before we write. The cloud watcher pushes
+    response data to this same file independently, so this is what keeps
+    us from writing on top of a stale local copy."""
+    try:
+        subprocess.run(
+            ["git", "pull", "--rebase", "--autostash"],
+            check=True, capture_output=True, timeout=20,
+        )
+    except Exception as e:
+        print(f"[git] pull failed (continuing with local copy): {e}")
+
+
+def git_push_log(retries: int = PUSH_RETRIES):
     """Commit + push the log file so the cloud watcher can see it.
-    Silently no-ops on failure (e.g. no network) rather than crashing
-    the listener — a chunk just waits to sync on the next successful push."""
+
+    A plain push can get rejected (non-fast-forward) if the cloud watcher
+    pushed in between our pull and our push -- that's a normal race, not
+    an error. On rejection we pull-rebase and retry a few times before
+    giving up (a chunk just waits to sync on the next successful push)."""
     try:
         subprocess.run(["git", "add", LOG_FILE], check=True, capture_output=True)
         result = subprocess.run(
@@ -98,14 +126,25 @@ def git_push_log():
         )
         if result.returncode != 0:
             return  # nothing to commit
-        subprocess.run(["git", "push"], check=True, capture_output=True, timeout=15)
+
+        for attempt in range(1, retries + 1):
+            push = subprocess.run(["git", "push"], capture_output=True, timeout=15)
+            if push.returncode == 0:
+                return
+            print(f"[git] push rejected (attempt {attempt}/{retries}), syncing and retrying...")
+            subprocess.run(
+                ["git", "pull", "--rebase", "--autostash"],
+                capture_output=True, timeout=20,
+            )
+        print("[git] push still failing after retries (will retry next chunk)")
     except Exception as e:
         print(f"[git] push failed (will retry next chunk): {e}")
 
 
-def worker_loop(work_q: "queue.Queue", entries: list, tool, t_start: float, state: dict):
+def worker_loop(work_q: "queue.Queue", tool, t_start: float):
     """Runs on a background thread: does the slow stuff (grammar correction,
-    disk write, printing) so the mic-reading loop never has to wait on it."""
+    git sync, disk write, printing) so the mic-reading loop never has to
+    wait on it."""
     while True:
         item = work_q.get()
         if item is None:
@@ -120,6 +159,12 @@ def worker_loop(work_q: "queue.Queue", entries: list, tool, t_start: float, stat
         if SHOW_PARTIAL_PREVIEW:
             sys.stdout.write("\r" + " " * 80 + "\r")
         print(f"[t={fmt(elapsed)} | +{fmt(since_last)} since last]  {fixed}{tag}")
+
+        # Sync first, then reload from disk -- never trust an in-memory
+        # copy here, since the cloud watcher may have added response
+        # fields to earlier entries since we last looked.
+        git_pull_log()
+        entries = load_log()
 
         entry = {
             "datetime": datetime.now().isoformat(timespec="seconds"),
@@ -162,7 +207,7 @@ def live_split():
     work_q: "queue.Queue" = queue.Queue()
     worker = threading.Thread(
         target=worker_loop,
-        args=(work_q, entries, tool, t_start, {}),
+        args=(work_q, tool, t_start),
         daemon=True,
     )
     worker.start()
