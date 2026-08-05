@@ -4,5 +4,11 @@
     "talk_seconds": 2.16,
     "text": "Hey how's it going",
     "raw_text": "hey how's it going"
+  },
+  {
+    "datetime": "2026-08-05T17:55:44",
+    "talk_seconds": 1.29,
+    "text": "Can you give me a reply",
+    "raw_text": "can you give me a reply"
   }
 ]
