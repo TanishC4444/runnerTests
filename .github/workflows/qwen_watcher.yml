@@ -23,9 +23,9 @@ jobs:
             curl -sf http://localhost:11434/api/tags && break
             sleep 1
           done
-      - name: Cache Ollama models
+      - name: Restore Ollama model cache
         id: cache-ollama
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/.ollama/models
           key: ollama-qwen2.5-3b-v1
@@ -37,6 +37,19 @@ jobs:
             echo "Not found in restored cache, pulling..."
             ollama pull qwen2.5:3b
           fi
+      - name: Save Ollama model cache
+        # Save it right here, immediately after the pull -- not deferred
+        # to the job's post-cleanup phase. run_all.py cancels this
+        # workflow run via the API on every session, and a cancelled
+        # job's post-steps get a very short grace period, which isn't
+        # enough time for a multi-GB cache upload to finish. Saving now,
+        # before the long watcher-loop step (the one that gets
+        # cancelled) even starts, means the cache always gets written.
+        if: steps.cache-ollama.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-qwen2.5-3b-v1
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
