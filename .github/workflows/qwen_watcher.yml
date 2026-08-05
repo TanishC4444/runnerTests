@@ -1,0 +1,58 @@
+name: Qwen Chunk Watcher
+
+# Triggered manually (via API/token) or on push to the chunks file.
+on:
+  workflow_dispatch: {}
+  push:
+    paths:
+      - "chat/Log 1/chunks.json"
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # stay under the 360min (6h) hard cap
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # PAT stored as a repo secret, never hardcoded
+          token: ${{ secrets.RUNNER_PAT }}
+
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: Install Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          nohup ollama serve > ollama.log 2>&1 &
+          # wait for the server to come up
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:11434/api/tags && break
+            sleep 1
+          done
+
+      - name: Pull Qwen 2.5 3B
+        run: ollama pull qwen2.5:3b
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: pip install requests gTTS
+
+      - name: Run watcher loop
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python .github/scripts/watch_and_respond.py
