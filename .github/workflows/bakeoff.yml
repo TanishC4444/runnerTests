@@ -1,4 +1,4 @@
-name: Local AI Model Bake-Off (Deep, 20+ Models)
+name: Local AI Model Bake-Off (Parallel, one model per runner)
 
 on:
   workflow_dispatch:
@@ -16,22 +16,13 @@ on:
           deepseek-r1:1.5b,deepseek-r1:7b,deepseek-r1:8b,
           codegemma:7b,starcoder2:3b,
           hermes3:8b,gpt-oss:20b
-      # NOTE on the model list: on-disk weights for all 24 tags total roughly
-      # 75-80GB. A stock ubuntu-latest runner has ~14GB free by default. The
-      # "Free disk space" step below removes preinstalled toolchains
-      # (dotnet, Android SDK, GHC, CodeQL, unused Docker images, etc.) to
-      # claw back another ~30-40GB, but you can still run out before the
-      # list finishes -- that's fine, the pull step skips failures and
-      # keeps going, so you'll just get fewer completed models in the report.
-      # If you want ALL 24 to finish, either trim this list or point runs-on
-      # at a larger runner with more disk.
-      #
-      # NOTE on gpt-oss:20b: this needs ~14GB just for weights, on a runner with
-      # ~15GB total RAM. It's included on purpose as a stress test -- expect it
-      # to be slow, possibly to time out, or in the worst case to OOM the whole
-      # job. That's a real, useful data point (it tells you gpt-oss genuinely
-      # doesn't fit here), not a bug. Remove it from the list if you'd rather
-      # not risk the whole run failing.
+      # Each model now gets its OWN runner, so per-runner disk is never an
+      # issue (biggest single model is gpt-oss:20b at ~14GB). The tradeoff
+      # is concurrency: GitHub caps how many jobs from one workflow run can
+      # execute at once. Free/Pro accounts: 20 concurrent jobs. Team: 40.
+      # Enterprise: up to 180. With 24 models and max-parallel: 20 below,
+      # 20 run immediately and the last 4 queue in as slots free up -- still
+      # far faster than the old serial version.
       trials_per_prompt:
         description: "How many times to repeat each prompt per model"
         type: string
@@ -41,35 +32,57 @@ on:
         type: string
         default: "100"
       per_model_timeout_sec:
-        description: "Hard cap per model (seconds) so one slow model can't eat the whole run"
+        description: "Soft cap (seconds) on prompt-loop time before moving to tool tests"
         type: string
         default: "900"
 
 jobs:
-  benchmark:
+  # ---------------------------------------------------------------------
+  # Turn the comma-separated input into a JSON array for the matrix below.
+  # ---------------------------------------------------------------------
+  prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 350  # stay under the 6-hour hard cap with margin
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
-      - name: Free disk space (clear the runner before pulling models)
+      - name: Build model matrix from input
+        id: set-matrix
         run: |
-          echo "### Disk usage BEFORE cleanup" >> $GITHUB_STEP_SUMMARY
-          df -h / | tee -a $GITHUB_STEP_SUMMARY
+          CLEAN=$(echo "${{ inputs.models }}" | tr -d ' \n')
+          JSON=$(python3 -c "
+          import json, sys
+          models = [m for m in sys.argv[1].split(',') if m]
+          print(json.dumps(models))
+          " "$CLEAN")
+          echo "matrix=$JSON" >> "$GITHUB_OUTPUT"
+          echo "Model matrix ($(echo "$JSON" | python3 -c 'import json,sys;print(len(json.load(sys.stdin)))') models): $JSON"
 
-          # Remove big preinstalled toolchains we don't need for this job.
-          # These are the usual suspects on GitHub-hosted ubuntu-latest runners.
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /usr/local/lib/android || true
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
-          sudo rm -rf /usr/local/.ghcup || true
-          sudo rm -rf /usr/local/share/boost || true
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+  # ---------------------------------------------------------------------
+  # One runner per model, all in parallel (up to max-parallel at a time).
+  # fail-fast: false so one model timing out/OOMing doesn't cancel the rest.
+  # ---------------------------------------------------------------------
+  benchmark:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        model: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Sanitize model name for artifact naming
+        id: safe-name
+        run: |
+          SAFE=$(echo "${{ matrix.model }}" | tr ':/' '--')
+          echo "name=$SAFE" >> "$GITHUB_OUTPUT"
+
+      - name: Free disk space (light cleanup, cheap insurance)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
           sudo docker image prune --all --force || true
-          sudo apt-get clean || true
-
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Disk usage AFTER cleanup" >> $GITHUB_STEP_SUMMARY
-          df -h / | tee -a $GITHUB_STEP_SUMMARY
+          df -h / | tail -1
 
       - name: Install Ollama
         run: |
@@ -87,29 +100,20 @@ jobs:
             sleep 1
           done
           curl -s http://localhost:11434
-          echo "### Baseline RAM before any model loaded" >> $GITHUB_STEP_SUMMARY
-          free -h | tee -a $GITHUB_STEP_SUMMARY
+          free -h
 
-      - name: Pull all test models (skip failures, keep going)
+      - name: Pull this runner's model
+        id: pull
         run: |
-          IFS=',' read -ra MODELS <<< "$(echo "${{ inputs.models }}" | tr -d ' \n')"
-          echo "### Pull results" >> $GITHUB_STEP_SUMMARY
-          for m in "${MODELS[@]}"; do
-            [ -z "$m" ] && continue
-            echo "=== Pulling $m ===" | tee -a $GITHUB_STEP_SUMMARY
-            if ollama pull "$m"; then
-              echo "OK: $m" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "FAILED: $m (will be skipped in benchmark)" >> $GITHUB_STEP_SUMMARY
-            fi
-            df -h / | tail -1 >> $GITHUB_STEP_SUMMARY
-          done
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Disk usage after pulling all models" >> $GITHUB_STEP_SUMMARY
-          df -h / | tee -a $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          ollama list >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "=== Pulling ${{ matrix.model }} ==="
+          if ollama pull "${{ matrix.model }}"; then
+            echo "pulled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pulled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Pull failed for ${{ matrix.model }} — this model will be recorded as a failure and skipped."
+          fi
+          df -h / | tail -1
+          ollama list
 
       - name: Write benchmark prompt set
         run: |
@@ -122,7 +126,6 @@ jobs:
             {"category": "instruction_following", "prompt": "List exactly 5 fruits, one per line, numbered 1 through 5, nothing else."}
           ]
           EOF
-          cat /tmp/bench/prompts.json
 
       - name: Write MCP / tool-calling test cases
         run: |
@@ -199,48 +202,39 @@ jobs:
             }
           ]
           EOF
-          cat /tmp/bench/tool_tests.json
 
-      - name: Run the deep bake-off (speed + RAM + disk + output quality)
+      - name: Benchmark this model (speed + RAM + tool-calling)
         run: |
-          cat > /tmp/bench/run.py << 'PYEOF'
-          import json, time, subprocess, os, csv, statistics, threading, re
+          cat > /tmp/bench/run_single.py << 'PYEOF'
+          import json, time, subprocess, os, csv, threading, re
           import urllib.request
           import psutil
 
-          MODELS = [m for m in os.environ["MODELS"].split(",") if m]
+          MODEL = os.environ["MODEL"]
           TRIALS = int(os.environ["TRIALS"])
           MAX_TOKENS = int(os.environ["MAX_TOKENS"])
           PER_MODEL_TIMEOUT = int(os.environ["PER_MODEL_TIMEOUT"])
 
           with open("/tmp/bench/prompts.json") as f:
               PROMPTS = json.load(f)
+          with open("/tmp/bench/tool_tests.json") as f:
+              TOOL_TESTS = json.load(f)
 
-          results = []
-
-          def get_model_disk_size_mb():
-              """Parse `ollama list` for on-disk size per model tag.
-              Handles both 'NNNMB' and 'NNN MB' (space-separated) formats,
-              since Ollama's own formatting has varied across versions."""
+          def get_model_disk_size_mb(model):
               out = subprocess.run(["ollama", "list"], capture_output=True, text=True).stdout
-              sizes = {}
               for line in out.splitlines()[1:]:
-                  if not line.strip():
+                  if not line.strip() or line.split()[0] != model:
                       continue
                   m = re.search(r"([\d.]+)\s*(GB|MB)", line, re.IGNORECASE)
-                  name = line.split()[0] if line.split() else None
-                  if not name or not m:
-                      continue
+                  if not m:
+                      return None
                   value, unit = float(m.group(1)), m.group(2).upper()
-                  mb = value * 1024 if unit == "GB" else value
-                  sizes[name] = round(mb, 1)
-              return sizes
+                  return round(value * 1024 if unit == "GB" else value, 1)
+              return None
 
-          DISK_SIZES = get_model_disk_size_mb()
+          DISK_SIZE_MB = get_model_disk_size_mb(MODEL)
 
           class RamSampler:
-              """Background thread sampling system used-RAM (MB) at high frequency
-              so we can capture the PEAK during a generation call, not just before/after."""
               def __init__(self, interval=0.2):
                   self.interval = interval
                   self.samples = []
@@ -266,18 +260,15 @@ jobs:
 
           def call_ollama(model, prompt, max_tokens):
               payload = json.dumps({
-                  "model": model,
-                  "prompt": prompt,
-                  "stream": False,
+                  "model": model, "prompt": prompt, "stream": False,
                   "options": {"num_predict": max_tokens}
               }).encode()
               req = urllib.request.Request(
-                  "http://localhost:11434/api/generate",
-                  data=payload,
+                  "http://localhost:11434/api/generate", data=payload,
                   headers={"Content-Type": "application/json"}
               )
               sampler = RamSampler()
-              baseline_ram_mb = psutil.virtual_memory().used / (1024 * 1024)
+              baseline = psutil.virtual_memory().used / (1024 * 1024)
               sampler.start()
               start = time.time()
               try:
@@ -288,12 +279,8 @@ jobs:
                   body, err = None, str(e)
               elapsed = time.time() - start
               samples = sampler.stop()
-              peak_ram_mb = max(samples) if samples else baseline_ram_mb
-              ram_delta_mb = round(peak_ram_mb - baseline_ram_mb, 1)
-              return body, elapsed, err, round(peak_ram_mb, 1), ram_delta_mb
-
-          with open("/tmp/bench/tool_tests.json") as f:
-              TOOL_TESTS = json.load(f)
+              peak = max(samples) if samples else baseline
+              return body, elapsed, err, round(peak, 1), round(peak - baseline, 1)
 
           def call_ollama_chat_with_tools(model, test):
               payload = json.dumps({
@@ -302,12 +289,10 @@ jobs:
                       {"role": "system", "content": test["system"]},
                       {"role": "user", "content": test["user"]},
                   ],
-                  "tools": test["tools"],
-                  "stream": False,
+                  "tools": test["tools"], "stream": False,
               }).encode()
               req = urllib.request.Request(
-                  "http://localhost:11434/api/chat",
-                  data=payload,
+                  "http://localhost:11434/api/chat", data=payload,
                   headers={"Content-Type": "application/json"}
               )
               start = time.time()
@@ -317,32 +302,25 @@ jobs:
                   err = None
               except Exception as e:
                   body, err = None, str(e)
-              elapsed = time.time() - start
-              return body, elapsed, err
+              return body, time.time() - start, err
 
           def score_tool_call(body, test):
-              """Returns (called_a_tool, correct_function, correct_args, notes)"""
               if not body:
                   return False, False, False, "no response body"
               msg = body.get("message", {})
               tool_calls = msg.get("tool_calls") or []
               called = len(tool_calls) > 0
-
               if test["expect_function"] is None:
-                  # this test expects NO tool call (a distractor test)
-                  correct_fn = not called
-                  return called, correct_fn, correct_fn, (
-                      "correctly avoided calling a tool" if correct_fn
+                  correct = not called
+                  return called, correct, correct, (
+                      "correctly avoided calling a tool" if correct
                       else "incorrectly called a tool when it shouldn't have"
                   )
-
               if not called:
                   return False, False, False, "model did not call any tool"
-
               fn = tool_calls[0].get("function", {})
               fn_name = fn.get("name", "")
               correct_fn = fn_name == test["expect_function"]
-
               args = fn.get("arguments", {})
               if isinstance(args, str):
                   try:
@@ -352,209 +330,220 @@ jobs:
               correct_args = True
               if test["expect_arg_substring"]:
                   for k, expected_sub in test["expect_arg_substring"].items():
-                      actual = str(args.get(k, "")).lower()
-                      if expected_sub not in actual:
+                      if expected_sub not in str(args.get(k, "")).lower():
                           correct_args = False
               return called, correct_fn, correct_args, f"called {fn_name} with args {args}"
 
+          results = []
           tool_results = []
 
-          for model in MODELS:
-              print(f"\n=== BENCHMARKING {model} ===", flush=True)
-              check = subprocess.run(["ollama", "list"], capture_output=True, text=True)
-              if model not in check.stdout:
-                  print(f"SKIP {model}: not present locally (pull likely failed)")
-                  results.append({
-                      "model": model, "category": "N/A", "trial": 0, "prompt": "",
-                      "elapsed_sec": None, "error": "pull_failed_or_missing",
-                      "output": "", "output_len_chars": 0, "tokens_generated": 0,
-                      "tokens_per_sec": None, "load_time_sec": None,
-                      "peak_ram_mb": None, "ram_delta_mb": None,
-                      "disk_size_mb": DISK_SIZES.get(model),
-                  })
-                  continue
-
+          check = subprocess.run(["ollama", "list"], capture_output=True, text=True)
+          if MODEL not in check.stdout:
+              print(f"SKIP {MODEL}: not present locally (pull failed)")
+              results.append({
+                  "model": MODEL, "category": "N/A", "trial": 0, "prompt": "",
+                  "elapsed_sec": None, "error": "pull_failed_or_missing",
+                  "output": "", "output_len_chars": 0, "tokens_generated": 0,
+                  "tokens_per_sec": None, "load_time_sec": None,
+                  "peak_ram_mb": None, "ram_delta_mb": None, "disk_size_mb": DISK_SIZE_MB,
+              })
+          else:
               model_start = time.time()
-              model_had_timeout = False
-
+              timed_out = False
               for p in PROMPTS:
                   for trial in range(1, TRIALS + 1):
                       if time.time() - model_start > PER_MODEL_TIMEOUT:
-                          model_had_timeout = True
+                          timed_out = True
                           break
-                      print(f"  [{model}] {p['category']} trial {trial}/{TRIALS}...", flush=True)
-                      body, elapsed, err, peak_ram, ram_delta = call_ollama(model, p["prompt"], MAX_TOKENS)
+                      print(f"  {p['category']} trial {trial}/{TRIALS}...", flush=True)
+                      body, elapsed, err, peak_ram, ram_delta = call_ollama(MODEL, p["prompt"], MAX_TOKENS)
                       row = {
-                          "model": model,
-                          "category": p["category"],
-                          "trial": trial,
-                          "prompt": p["prompt"],
-                          "elapsed_sec": round(elapsed, 3),
-                          "error": err,
-                          "peak_ram_mb": peak_ram,
-                          "ram_delta_mb": ram_delta,
-                          "disk_size_mb": DISK_SIZES.get(model),
+                          "model": MODEL, "category": p["category"], "trial": trial,
+                          "prompt": p["prompt"], "elapsed_sec": round(elapsed, 3), "error": err,
+                          "peak_ram_mb": peak_ram, "ram_delta_mb": ram_delta, "disk_size_mb": DISK_SIZE_MB,
                       }
                       if body and not err:
                           output_text = body.get("response", "").strip()
                           eval_count = body.get("eval_count", 0)
-                          eval_duration_ns = body.get("eval_duration", 0)
-                          load_duration_ns = body.get("load_duration", 0)
-                          tok_per_sec = (eval_count / (eval_duration_ns / 1e9)) if eval_duration_ns else None
+                          eval_ns = body.get("eval_duration", 0)
+                          load_ns = body.get("load_duration", 0)
+                          tok_s = (eval_count / (eval_ns / 1e9)) if eval_ns else None
                           row.update({
-                              "output": output_text[:500],
-                              "output_len_chars": len(output_text),
+                              "output": output_text[:500], "output_len_chars": len(output_text),
                               "tokens_generated": eval_count,
-                              "tokens_per_sec": round(tok_per_sec, 2) if tok_per_sec else None,
-                              "load_time_sec": round(load_duration_ns / 1e9, 3),
+                              "tokens_per_sec": round(tok_s, 2) if tok_s else None,
+                              "load_time_sec": round(load_ns / 1e9, 3),
                           })
                       else:
-                          row.update({
-                              "output": "", "output_len_chars": 0, "tokens_generated": 0,
-                              "tokens_per_sec": None, "load_time_sec": None,
-                          })
+                          row.update({"output": "", "output_len_chars": 0, "tokens_generated": 0,
+                                      "tokens_per_sec": None, "load_time_sec": None})
                       results.append(row)
-                  if model_had_timeout:
-                      print(f"  TIMEOUT budget hit for {model}, moving to next model")
+                  if timed_out:
+                      print("  per-model time budget hit, moving to tool tests")
                       break
 
-              # ---- MCP / tool-calling capability tests ----
-              print(f"  [{model}] running tool-calling tests...", flush=True)
+              print("  running tool-calling tests...", flush=True)
               for test in TOOL_TESTS:
-                  body, elapsed, err = call_ollama_chat_with_tools(model, test)
-                  called, correct_fn, correct_args, notes = score_tool_call(body, test) if not err else (False, False, False, err)
+                  body, elapsed, err = call_ollama_chat_with_tools(MODEL, test)
+                  called, correct_fn, correct_args, notes = (
+                      score_tool_call(body, test) if not err else (False, False, False, err)
+                  )
                   tool_results.append({
-                      "model": model,
-                      "test_name": test["name"],
-                      "elapsed_sec": round(elapsed, 3),
-                      "called_tool": called,
-                      "correct_function": correct_fn,
-                      "correct_args": correct_args,
-                      "passed": correct_fn and correct_args,
-                      "notes": notes,
-                      "error": err,
+                      "model": MODEL, "test_name": test["name"], "elapsed_sec": round(elapsed, 3),
+                      "called_tool": called, "correct_function": correct_fn,
+                      "correct_args": correct_args, "passed": correct_fn and correct_args,
+                      "notes": notes, "error": err,
                   })
+              subprocess.run(["ollama", "stop", MODEL], capture_output=True)
 
-              # free the model from memory before loading the next one, so RAM
-              # numbers for the next model aren't polluted by this one still resident
-              subprocess.run(["ollama", "stop", model], capture_output=True)
+          with open("/tmp/bench/raw_results.json", "w") as f:
+              json.dump(results, f, indent=2)
+          with open("/tmp/bench/raw_results.csv", "w", newline="") as f:
+              fieldnames = ["model","category","trial","elapsed_sec","tokens_generated",
+                            "tokens_per_sec","load_time_sec","peak_ram_mb","ram_delta_mb",
+                            "disk_size_mb","output_len_chars","error","output","prompt"]
+              w = csv.DictWriter(f, fieldnames=fieldnames)
+              w.writeheader()
+              for r in results:
+                  w.writerow(r)
 
           with open("/tmp/bench/tool_results.json", "w") as f:
               json.dump(tool_results, f, indent=2)
-
           with open("/tmp/bench/tool_results.csv", "w", newline="") as f:
-              writer = csv.DictWriter(f, fieldnames=["model","test_name","elapsed_sec","called_tool",
-                                                       "correct_function","correct_args","passed","notes","error"])
-              writer.writeheader()
+              fieldnames = ["model","test_name","elapsed_sec","called_tool","correct_function",
+                            "correct_args","passed","notes","error"]
+              w = csv.DictWriter(f, fieldnames=fieldnames)
+              w.writeheader()
               for r in tool_results:
-                  writer.writerow(r)
+                  w.writerow(r)
 
-          # per-model tool-use pass rate, out of len(TOOL_TESTS)
-          tool_summary = {}
-          for r in tool_results:
-              m = r["model"]
-              tool_summary.setdefault(m, {"passed": 0, "total": 0})
-              tool_summary[m]["total"] += 1
-              if r["passed"]:
-                  tool_summary[m]["passed"] += 1
+          # single-model summary, so the merge job doesn't need to recompute stats
+          speeds = [r["tokens_per_sec"] for r in results if r.get("tokens_per_sec")]
+          elapsed_list = [r["elapsed_sec"] for r in results if r.get("elapsed_sec") is not None]
+          ram_deltas = [r["ram_delta_mb"] for r in results if r.get("ram_delta_mb") is not None]
+          peak_rams = [r["peak_ram_mb"] for r in results if r.get("peak_ram_mb") is not None]
+          passed = sum(1 for r in tool_results if r["passed"])
+          summary = {
+              "model": MODEL,
+              "disk_size_mb": DISK_SIZE_MB,
+              "runs": len(results),
+              "errors": sum(1 for r in results if r.get("error")),
+              "avg_tokens_per_sec": round(sum(speeds) / len(speeds), 2) if speeds else None,
+              "avg_response_time_sec": round(sum(elapsed_list) / len(elapsed_list), 2) if elapsed_list else None,
+              "avg_ram_delta_mb": round(sum(ram_deltas) / len(ram_deltas), 1) if ram_deltas else None,
+              "peak_ram_mb": round(max(peak_rams), 1) if peak_rams else None,
+              "tool_use_pass_rate": f"{passed}/{len(tool_results)}" if tool_results else "N/A",
+          }
+          with open("/tmp/bench/model_summary.json", "w") as f:
+              json.dump(summary, f, indent=2)
 
-          # ---- write raw results ----
-          with open("/tmp/bench/raw_results.json", "w") as f:
-              json.dump(results, f, indent=2)
+          print("\n" + json.dumps(summary, indent=2))
+          PYEOF
 
-          fieldnames = ["model","category","trial","elapsed_sec","tokens_generated",
-                        "tokens_per_sec","load_time_sec","peak_ram_mb","ram_delta_mb",
-                        "disk_size_mb","output_len_chars","error","output","prompt"]
-          with open("/tmp/bench/raw_results.csv", "w", newline="") as f:
-              writer = csv.DictWriter(f, fieldnames=fieldnames)
-              writer.writeheader()
-              for r in results:
-                  writer.writerow(r)
+          MODEL="${{ matrix.model }}" \
+          TRIALS="${{ inputs.trials_per_prompt }}" \
+          MAX_TOKENS="${{ inputs.max_tokens }}" \
+          PER_MODEL_TIMEOUT="${{ inputs.per_model_timeout_sec }}" \
+            python3 /tmp/bench/run_single.py
 
-          # ---- aggregate per model ----
-          summary = {}
-          for r in results:
-              m = r["model"]
-              summary.setdefault(m, {"speeds": [], "elapsed": [], "ram_deltas": [], "peak_rams": [],
-                                       "errors": 0, "total": 0, "disk_mb": r.get("disk_size_mb")})
-              summary[m]["total"] += 1
-              if r["error"]:
-                  summary[m]["errors"] += 1
-                  continue
-              if r["tokens_per_sec"]:
-                  summary[m]["speeds"].append(r["tokens_per_sec"])
-              if r["elapsed_sec"] is not None:
-                  summary[m]["elapsed"].append(r["elapsed_sec"])
-              if r["ram_delta_mb"] is not None:
-                  summary[m]["ram_deltas"].append(r["ram_delta_mb"])
-              if r["peak_ram_mb"] is not None:
-                  summary[m]["peak_rams"].append(r["peak_ram_mb"])
+      - name: Upload this model's results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bakeoff-${{ steps.safe-name.outputs.name }}
+          path: |
+            /tmp/bench/raw_results.json
+            /tmp/bench/raw_results.csv
+            /tmp/bench/tool_results.json
+            /tmp/bench/tool_results.csv
+            /tmp/bench/model_summary.json
+          retention-days: 14
 
-          agg_rows = []
-          for m, d in summary.items():
-              ts = tool_summary.get(m, {"passed": 0, "total": 0})
-              tool_pass_rate = f"{ts['passed']}/{ts['total']}" if ts["total"] else "N/A"
-              agg_rows.append({
-                  "model": m,
-                  "disk_size_mb": d["disk_mb"],
-                  "runs": d["total"],
-                  "errors": d["errors"],
-                  "avg_tokens_per_sec": round(statistics.mean(d["speeds"]), 2) if d["speeds"] else None,
-                  "median_tokens_per_sec": round(statistics.median(d["speeds"]), 2) if d["speeds"] else None,
-                  "avg_response_time_sec": round(statistics.mean(d["elapsed"]), 2) if d["elapsed"] else None,
-                  "avg_ram_delta_mb": round(statistics.mean(d["ram_deltas"]), 1) if d["ram_deltas"] else None,
-                  "peak_ram_mb": round(max(d["peak_rams"]), 1) if d["peak_rams"] else None,
-                  "tool_use_pass_rate": tool_pass_rate,
-              })
+  # ---------------------------------------------------------------------
+  # Runs once, after all matrix legs finish (even if some failed/timed out),
+  # and combines every model's artifact into one ranked report.
+  # ---------------------------------------------------------------------
+  merge:
+    needs: benchmark
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all per-model artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bakeoff-*
+          path: /tmp/artifacts
 
-          # sort by speed, fastest first (None speeds/full-fail models go last)
-          agg_rows.sort(key=lambda x: (x["avg_tokens_per_sec"] is None, -(x["avg_tokens_per_sec"] or 0)))
+      - name: Merge into final ranked report
+        run: |
+          mkdir -p /tmp/merged
+          cat > /tmp/merge.py << 'PYEOF'
+          import json, csv, glob, os
 
-          with open("/tmp/bench/summary.json", "w") as f:
-              json.dump(agg_rows, f, indent=2)
+          all_results, all_tools, all_summaries = [], [], []
+          for d in sorted(glob.glob("/tmp/artifacts/*")):
+              for fname, bucket in [("raw_results.json", all_results),
+                                     ("tool_results.json", all_tools),
+                                     ("model_summary.json", None)]:
+                  path = os.path.join(d, fname)
+                  if not os.path.exists(path):
+                      continue
+                  with open(path) as f:
+                      data = json.load(f)
+                  if fname == "model_summary.json":
+                      all_summaries.append(data)
+                  else:
+                      bucket.extend(data if isinstance(data, list) else [data])
 
-          # ---- build the final markdown report ----
+          all_summaries.sort(key=lambda x: (x["avg_tokens_per_sec"] is None, -(x["avg_tokens_per_sec"] or 0)))
+
+          with open("/tmp/merged/raw_results_all.json", "w") as f:
+              json.dump(all_results, f, indent=2)
+          with open("/tmp/merged/tool_results_all.json", "w") as f:
+              json.dump(all_tools, f, indent=2)
+          with open("/tmp/merged/summary.json", "w") as f:
+              json.dump(all_summaries, f, indent=2)
+
+          if all_results:
+              fieldnames = list(all_results[0].keys())
+              with open("/tmp/merged/raw_results_all.csv", "w", newline="") as f:
+                  w = csv.DictWriter(f, fieldnames=fieldnames)
+                  w.writeheader()
+                  for r in all_results:
+                      w.writerow(r)
+          if all_tools:
+              fieldnames = list(all_tools[0].keys())
+              with open("/tmp/merged/tool_results_all.csv", "w", newline="") as f:
+                  w = csv.DictWriter(f, fieldnames=fieldnames)
+                  w.writeheader()
+                  for r in all_tools:
+                      w.writerow(r)
+
           lines = []
-          lines.append("# Local AI Model Bake-Off — Deep Results\n")
-          lines.append(f"Models attempted: {len(MODELS)}  ")
-          lines.append(f"Trials per prompt: {TRIALS}  ")
-          lines.append(f"Prompt categories: {', '.join(p['category'] for p in PROMPTS)}  ")
-          lines.append(f"Per-model time budget: {PER_MODEL_TIMEOUT}s\n")
-
+          lines.append("# Local AI Model Bake-Off — Merged Parallel Results\n")
+          lines.append(f"Models with data: {len(all_summaries)}\n")
           lines.append("## Ranked Summary (fastest first)\n")
-          lines.append("| Rank | Model | Disk (MB) | Avg tok/s | Median tok/s | Avg resp time (s) | Avg RAM delta (MB) | Peak RAM (MB) | Tool-use pass | Runs | Errors |")
-          lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
-          for i, r in enumerate(agg_rows, 1):
+          lines.append("| Rank | Model | Disk (MB) | Avg tok/s | Avg resp time (s) | Avg RAM delta (MB) | Peak RAM (MB) | Tool-use pass | Runs | Errors |")
+          lines.append("|---|---|---|---|---|---|---|---|---|---|")
+          for i, r in enumerate(all_summaries, 1):
               lines.append(
                   f"| {i} | {r['model']} | {r['disk_size_mb']} | {r['avg_tokens_per_sec']} | "
-                  f"{r['median_tokens_per_sec']} | {r['avg_response_time_sec']} | "
-                  f"{r['avg_ram_delta_mb']} | {r['peak_ram_mb']} | {r['tool_use_pass_rate']} | "
-                  f"{r['runs']} | {r['errors']} |"
+                  f"{r['avg_response_time_sec']} | {r['avg_ram_delta_mb']} | {r['peak_ram_mb']} | "
+                  f"{r['tool_use_pass_rate']} | {r['runs']} | {r['errors']} |"
               )
 
-          lines.append("\n## MCP / Tool-Calling Detail (3 tests per model)\n")
-          lines.append("Tests: **basic_tool_call** (should call a weather tool), "
-                        "**skill_style_docx_tool** (mimics an MCP-style docx-creation skill), "
-                        "**should_not_call_tool** (distractor — correct behavior is NOT calling the tool).\n")
+          lines.append("\n## MCP / Tool-Calling Detail\n")
           lines.append("| Model | Test | Called tool? | Correct function? | Correct args? | Passed | Notes |")
           lines.append("|---|---|---|---|---|---|---|")
-          for r in tool_results:
+          for r in all_tools:
               lines.append(
                   f"| {r['model']} | {r['test_name']} | {r['called_tool']} | {r['correct_function']} | "
                   f"{r['correct_args']} | {'✅' if r['passed'] else '❌'} | {str(r['notes'])[:120]} |"
               )
 
-          lines.append("\n## Notes on the numbers\n")
-          lines.append("- **Disk (MB)**: on-disk size of the pulled model, from `ollama list`.")
-          lines.append("- **Avg/Median tok/s**: generation speed, from Ollama's own `eval_count`/`eval_duration`.")
-          lines.append("- **Avg RAM delta**: how much *additional* system RAM was consumed during generation vs. the moment just before the call — approximates the model's real working-memory footprint (weights + KV cache + overhead) on this run.")
-          lines.append("- **Peak RAM**: the highest *total* system RAM used at any point while that model was tested.")
-          lines.append("- **Runs/Errors**: total prompt×trial attempts vs. how many failed (pull failure, timeout, crash).")
-          lines.append("- This ran on a shared, CPU-only GitHub-hosted runner — absolute speed numbers won't match your own hardware, but relative ranking between models is meaningful.\n")
-
-          lines.append("## Sample outputs (first trial of each model/category)\n")
+          lines.append("\n## Sample outputs (first trial of each model/category)\n")
           seen = set()
-          for r in results:
+          for r in all_results:
               key = (r["model"], r["category"])
               if key in seen or r.get("trial") != 1:
                   continue
@@ -562,7 +551,7 @@ jobs:
               lines.append(f"### {r['model']} — {r['category']}")
               if r.get("prompt"):
                   lines.append(f"**Prompt:** {r['prompt']}\n")
-              if r["error"]:
+              if r.get("error"):
                   lines.append(f"**Error:** {r['error']}\n")
               else:
                   lines.append(f"**Output** ({r.get('tokens_generated', 0)} tokens, {r.get('tokens_per_sec')} tok/s, "
@@ -570,46 +559,20 @@ jobs:
                   lines.append(f"> {r['output']}\n")
 
           report = "\n".join(lines)
-          with open("/tmp/bench/report.md", "w") as f:
+          with open("/tmp/merged/report.md", "w") as f:
               f.write(report)
-
-          print("\n\n" + report)
+          print(report)
           PYEOF
+          python3 /tmp/merge.py
 
-          MODELS="${{ inputs.models }}" \
-          TRIALS="${{ inputs.trials_per_prompt }}" \
-          MAX_TOKENS="${{ inputs.max_tokens }}" \
-          PER_MODEL_TIMEOUT="${{ inputs.per_model_timeout_sec }}" \
-            python3 /tmp/bench/run.py
-
-      - name: Final disk & RAM usage
+      - name: Append merged report to job summary
         if: always()
-        run: |
-          echo "### Final disk usage" >> $GITHUB_STEP_SUMMARY
-          df -h / | tee -a $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Final RAM usage" >> $GITHUB_STEP_SUMMARY
-          free -h | tee -a $GITHUB_STEP_SUMMARY
+        run: cat /tmp/merged/report.md >> $GITHUB_STEP_SUMMARY
 
-      - name: Append report to job summary
-        if: always()
-        run: |
-          if [ -f /tmp/bench/report.md ]; then
-            cat /tmp/bench/report.md >> $GITHUB_STEP_SUMMARY
-          else
-            echo "Benchmark did not produce a report (check earlier step logs)" >> $GITHUB_STEP_SUMMARY
-          fi
-
-      - name: Upload full results (raw + summary + tool-calling + report)
+      - name: Upload FINAL merged results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: local-ai-bakeoff-deep-results
-          path: |
-            /tmp/bench/report.md
-            /tmp/bench/summary.json
-            /tmp/bench/raw_results.json
-            /tmp/bench/raw_results.csv
-            /tmp/bench/tool_results.json
-            /tmp/bench/tool_results.csv
-          retention-days: 14
+          name: local-ai-bakeoff-FINAL-merged-results
+          path: /tmp/merged/*
+          retention-days: 30
