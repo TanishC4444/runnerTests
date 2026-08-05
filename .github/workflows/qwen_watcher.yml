@@ -22,19 +22,35 @@ jobs:
             /usr/local/bin/ollama
             /usr/local/lib/ollama
           key: ollama-bin-linux-v1
+        continue-on-error: true   # caching is a nice-to-have, never worth failing the session over
       - name: Install Ollama (skip download if cached)
         run: |
+          # guarantee this exists even on Ollama versions that don't create
+          # it, so the save step below never fails with "path does not exist"
+          mkdir -p /usr/local/lib/ollama
+
           if [ -x /usr/local/bin/ollama ]; then
             echo "Ollama binary restored from cache, skipping install script."
           else
             curl -fsSL https://ollama.com/install.sh | sh
           fi
+          ollama --version
+
           nohup ollama serve > ollama.log 2>&1 &
           # wait for the server to come up
+          ready=""
           for i in $(seq 1 30); do
-            curl -sf http://localhost:11434/api/tags && break
+            if curl -sf http://localhost:11434/api/tags > /dev/null; then
+              ready=1
+              break
+            fi
             sleep 1
           done
+          if [ -z "$ready" ]; then
+            echo "::error::Ollama server never became reachable, dumping log:"
+            cat ollama.log
+            exit 1
+          fi
       - name: Save Ollama binary cache
         # Same reasoning as the model cache below: save immediately after
         # confirming ollama serve works, not deferred to job post-cleanup,
@@ -47,12 +63,14 @@ jobs:
             /usr/local/bin/ollama
             /usr/local/lib/ollama
           key: ollama-bin-linux-v1
+        continue-on-error: true
       - name: Restore Ollama model cache
         id: cache-ollama
         uses: actions/cache/restore@v4
         with:
           path: ~/.ollama/models
           key: ollama-qwen2.5-3b-v1
+        continue-on-error: true
       - name: Pull Qwen 2.5 3B (skip if already cached)
         run: |
           if ollama list | grep -q "qwen2.5:3b"; then
@@ -74,6 +92,7 @@ jobs:
         with:
           path: ~/.ollama/models
           key: ollama-qwen2.5-3b-v1
+        continue-on-error: true
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
