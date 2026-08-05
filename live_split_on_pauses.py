@@ -153,7 +153,8 @@ def live_split():
 
     entries = load_log()
     print(f"Logging to {LOG_FILE} ({len(entries)} existing entries)")
-    print(f"Listening... a {PAUSE_MS}ms pause ends a chunk. Ctrl+C to stop.\n")
+    print(f"Listening... a {PAUSE_MS}ms pause ends a chunk. Ctrl+C to stop.")
+    print("Type 'm' + Enter at any time to mute/unmute.\n")
 
     t_start = time.perf_counter()
     t_last_chunk = t_start
@@ -166,6 +167,25 @@ def live_split():
     )
     worker.start()
 
+    muted = threading.Event()
+
+    def mute_control_loop():
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                return
+            if line.strip().lower() in ("m", "mute"):
+                if muted.is_set():
+                    muted.clear()
+                    print("[mic] UNMUTED")
+                else:
+                    muted.set()
+                    print("[mic] MUTED — not listening")
+
+    control_thread = threading.Thread(target=mute_control_loop, daemon=True)
+    control_thread.start()
+
     silence_run = 0
     in_speech = False
     speech_run = 0       # frames flagged as actual speech, i.e. talk time
@@ -174,6 +194,18 @@ def live_split():
     try:
         while True:
             frame = stream.read(FRAME_BYTES // 2, exception_on_overflow=False)
+
+            if muted.is_set():
+                # keep pulling from the stream so the buffer doesn't
+                # overflow, but don't process anything while muted —
+                # also clear any in-progress chunk state so unmuting
+                # doesn't resume a stale half-finished chunk
+                in_speech = False
+                silence_run = 0
+                speech_run = 0
+                last_partial = ""
+                continue
+
             is_speech = vad.is_speech(frame, SAMPLE_RATE)
 
             rec.AcceptWaveform(frame)  # feed regardless, keeps partials live

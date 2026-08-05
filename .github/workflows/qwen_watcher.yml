@@ -28,6 +28,12 @@ jobs:
             sleep 1
           done
 
+      - name: Cache Ollama models
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-qwen2.5-3b-v1
+
       - name: Pull Qwen 2.5 3B
         run: ollama pull qwen2.5:3b
 
@@ -43,4 +49,4 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RUNNER_PAT }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: python .github/scripts/watch_and_respond.py
+        run: python watch_and_respond.py
