@@ -1,11 +1,10 @@
 name: Qwen Chunk Watcher
 
-# Triggered manually (via API/token) or on push to the chunks file.
+# Triggered manually (via API/token) once, at the start of a session.
+# NOT triggered per-chunk — one runner stays alive and works through
+# every chunk sequentially via its own poll loop.
 on:
   workflow_dispatch: {}
-  push:
-    paths:
-      - "chat/Log 1/chunks.json"
 
 jobs:
   watch:
@@ -18,17 +17,6 @@ jobs:
         with:
           # PAT stored as a repo secret, never hardcoded
           token: ${{ secrets.RUNNER_PAT }}
-
-      - name: Free up disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: false
 
       - name: Install Ollama
         run: |
