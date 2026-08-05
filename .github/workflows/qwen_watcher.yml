@@ -42,9 +42,12 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install Python deps
-        run: pip install requests gTTS
+        run: |
+          pip install requests gTTS
+          python -c "import requests, gtts; print('requests', requests.__version__); print('gTTS OK, module at', gtts.__file__)"
       - name: Run watcher loop
         env:
           GH_TOKEN: ${{ secrets.RUNNER_PAT }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: python watch_and_respond.py
+          PYTHONUNBUFFERED: "1"   # step logs are not a TTY -- without this, prints can sit buffered and invisible
+        run: python -u watch_and_respond.py

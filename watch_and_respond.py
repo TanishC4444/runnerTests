@@ -26,10 +26,18 @@ import base64
 import json
 import os
 import subprocess
+import sys
 import time
 
 import requests
 from gtts import gTTS
+
+# GitHub Actions doesn't attach a TTY to step output, so Python buffers
+# stdout by default -- prints can sit invisible for a long time instead
+# of showing up as they happen. Force line buffering so the log is live.
+sys.stdout.reconfigure(line_buffering=True)
+
+print(f"[deps] requests {requests.__version__}, gTTS import OK", flush=True)
 
 TOKEN = os.environ["GH_TOKEN"]
 REPO = os.environ["GITHUB_REPOSITORY"]  # "owner/repo"
@@ -80,12 +88,13 @@ def push_file(entries, sha, message):
     return resp.json()["content"]["sha"]
 
 
-def ask_qwen(text: str) -> str:
-    resp = requests.post(
-        OLLAMA_URL,
-        json={"model": MODEL, "prompt": text, "stream": False},
-        timeout=60,
-    )
+def ask_qwen(text: str, max_tokens: int | None = None) -> str:
+    payload = {"model": MODEL, "prompt": text, "stream": False}
+    if max_tokens is not None:
+        # caps generation length -- keeps the readiness warm-up fast on
+        # a CPU-only runner; real replies still run uncapped
+        payload["options"] = {"num_predict": max_tokens}
+    resp = requests.post(OLLAMA_URL, json=payload, timeout=120)
     resp.raise_for_status()
     return resp.json().get("response", "").strip()
 
@@ -123,27 +132,38 @@ def push_status(payload: dict, message: str):
 
 
 def announce_ready():
-    """Verbal cue: TTS a short line and push it to status.json. Called
-    once Ollama has actually answered a prompt, so "ready" means the
-    model is genuinely warmed up and not just that the process started."""
+    """Verbal cue: TTS a short line and push it to status.json.
+
+    The warm-up call caps output at a handful of tokens (num_predict) --
+    a full free-length generation on a CPU-only Actions runner can take
+    well over a minute, which made this look "stuck" even though it was
+    just slow. A capped call still proves the model is loaded and
+    generating, in a few seconds instead of a minute-plus."""
+    print("[ready] sending a capped warm-up prompt to confirm Qwen is loaded...", flush=True)
     try:
-        # a cheap real call, not just a health check -- confirms the
-        # model is loaded and generating, not just that the server is up
-        ask_qwen("Say 'ready' and nothing else.")
+        t0 = time.time()
+        ask_qwen("Say 'ready'.", max_tokens=5)
+        print(f"[ready] warm-up call answered in {time.time() - t0:.1f}s", flush=True)
         audio_b64 = tts_base64("I'm ready, go ahead.")
+        print("[ready] TTS generated.", flush=True)
     except Exception as e:
-        print(f"[ready] warm-up call failed, pushing text-only ready signal: {e}")
+        print(f"[ready] warm-up call failed, pushing text-only ready signal: {e}", flush=True)
         audio_b64 = None
 
-    push_status(
-        {
-            "ready": True,
-            "ready_audio_b64": audio_b64,
-            "ready_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        },
-        "Qwen watcher ready",
-    )
-    print("[ready] pushed verbal ready signal to status.json.")
+    try:
+        push_status(
+            {
+                "ready": True,
+                "ready_audio_b64": audio_b64,
+                "ready_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            },
+            "Qwen watcher ready",
+        )
+        print("[ready] pushed verbal ready signal to status.json.", flush=True)
+    except Exception as e:
+        # Don't let a failed ready-ping take down the whole watcher --
+        # chunk responses can still work even if this push fails.
+        print(f"[ready] failed to push status.json (continuing anyway): {e}", flush=True)
 
 
 def main():
@@ -181,12 +201,14 @@ def main():
                 if not text:
                     continue
 
-                print(f"Responding to: {text[:60]!r}")
+                print(f"Responding to: {text[:60]!r}", flush=True)
                 try:
+                    t0 = time.time()
                     reply = ask_qwen(text)
+                    print(f"  generated in {time.time() - t0:.1f}s: {reply[:60]!r}", flush=True)
                     audio_b64 = tts_base64(reply)
                 except Exception as e:
-                    print(f"Failed on entry: {e}")
+                    print(f"Failed on entry: {e}", flush=True)
                     continue
 
                 entry["response"] = reply

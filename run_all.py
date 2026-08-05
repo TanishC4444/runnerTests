@@ -116,9 +116,15 @@ def play_audio(path: str):
 def wait_for_ready(timeout_s: int = READY_TIMEOUT_S):
     """Poll status.json until the cloud watcher announces it's ready,
     then play its verbal cue. Returns either way once done or timed out
-    (a timeout just means you'll start listening a bit early)."""
+    (a timeout just means you'll start listening a bit early).
+
+    Prints an elapsed-time heartbeat every 15s -- the wait can legitimately
+    take a couple minutes (Ollama install + model load on a CPU-only
+    runner), and a silent wait is indistinguishable from a stuck one."""
     print("[cloud] waiting for Qwen to finish loading...")
-    deadline = time.time() + timeout_s
+    start = time.time()
+    deadline = start + timeout_s
+    last_heartbeat = start
     while time.time() < deadline:
         payload, _ = fetch_status()
         if payload and payload.get("ready"):
@@ -131,6 +137,11 @@ def wait_for_ready(timeout_s: int = READY_TIMEOUT_S):
             else:
                 print("[cloud] Qwen is ready (no audio cue was included).")
             return
+        now = time.time()
+        if now - last_heartbeat >= 15:
+            print(f"[cloud] ...still waiting ({int(now - start)}s elapsed). "
+                  f"Check the 'Run watcher loop' step's live log if this runs long.")
+            last_heartbeat = now
         time.sleep(2)
     print("[cloud] timed out waiting for the ready signal, starting listener anyway.")
 
