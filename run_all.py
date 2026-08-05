@@ -24,6 +24,7 @@ import platform
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 import requests
@@ -40,8 +41,11 @@ HEADERS = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github
 STATUS_FILE = "chat/Log 1/status.json"
 STATUS_API_URL = f"https://api.github.com/repos/{REPO}/contents/{STATUS_FILE}"
 
+CHUNKS_LOG_FILE = os.path.join("chat", "Log 1", "chunks.json")
+
 LISTENER_SCRIPT = "live_split_on_pauses.py"
 READY_TIMEOUT_S = 240  # generous: cold model pull + Ollama boot can be slow
+RESPONSE_POLL_SECONDS = 3
 
 
 def trigger_workflow():
@@ -146,6 +150,59 @@ def wait_for_ready(timeout_s: int = READY_TIMEOUT_S):
     print("[cloud] timed out waiting for the ready signal, starting listener anyway.")
 
 
+def load_chunks():
+    if os.path.exists(CHUNKS_LOG_FILE):
+        with open(CHUNKS_LOG_FILE, "r") as f:
+            try:
+                return json.load(f)
+            except json.JSONDecodeError:
+                return []
+    return []
+
+
+def git_pull_quiet():
+    """Best-effort pull -- if it fails (e.g. a lock held by the listener's
+    own concurrent pull), just skip this cycle and try again shortly."""
+    try:
+        subprocess.run(
+            ["git", "pull", "--rebase", "--autostash"],
+            capture_output=True, timeout=20,
+        )
+    except Exception:
+        pass
+
+
+def response_watcher_loop(stop_event: threading.Event):
+    """Background thread: periodically checks chunks.json for replies
+    that have landed from the cloud watcher and plays them out loud --
+    this is what actually makes Qwen "talk back" instead of you having
+    to go open the file yourself. Runs independently of the listener's
+    own git activity, which only happens when you're the one speaking."""
+    # seed with anything already answered from a previous session so we
+    # don't replay old responses on startup
+    played = {e.get("datetime") for e in load_chunks() if "response" in e}
+
+    while not stop_event.is_set():
+        git_pull_quiet()
+        for entry in load_chunks():
+            key = entry.get("datetime")
+            if key in played or "response" not in entry:
+                continue
+            played.add(key)
+
+            reply = entry.get("response", "")
+            print(f"[talkback] {reply[:60]!r}")
+
+            audio_b64 = entry.get("response_audio_b64")
+            if audio_b64:
+                tmp_path = os.path.join(tempfile.gettempdir(), "qwen_reply.mp3")
+                with open(tmp_path, "wb") as f:
+                    f.write(base64.b64decode(audio_b64))
+                play_audio(tmp_path)
+
+        stop_event.wait(RESPONSE_POLL_SECONDS)
+
+
 def main():
     reset_status()
     trigger_workflow()
@@ -166,6 +223,10 @@ def main():
     print("[local] starting mic listener...")
     listener = subprocess.Popen([sys.executable, LISTENER_SCRIPT])
 
+    stop_event = threading.Event()
+    responder = threading.Thread(target=response_watcher_loop, args=(stop_event,), daemon=True)
+    responder.start()
+
     print("\nReady. Idle until you speak. Ctrl+C to stop everything.\n")
 
     try:
@@ -177,6 +238,7 @@ def main():
     except KeyboardInterrupt:
         print("\nStopping...")
     finally:
+        stop_event.set()
         if listener.poll() is None:
             listener.terminate()
             try:

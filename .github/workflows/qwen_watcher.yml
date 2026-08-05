@@ -14,15 +14,39 @@ jobs:
         with:
           # PAT stored as a repo secret, never hardcoded
           token: ${{ secrets.RUNNER_PAT }}
-      - name: Install Ollama
+      - name: Restore Ollama binary cache
+        id: cache-ollama-bin
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /usr/local/bin/ollama
+            /usr/local/lib/ollama
+          key: ollama-bin-linux-v1
+      - name: Install Ollama (skip download if cached)
         run: |
-          curl -fsSL https://ollama.com/install.sh | sh
+          if [ -x /usr/local/bin/ollama ]; then
+            echo "Ollama binary restored from cache, skipping install script."
+          else
+            curl -fsSL https://ollama.com/install.sh | sh
+          fi
           nohup ollama serve > ollama.log 2>&1 &
           # wait for the server to come up
           for i in $(seq 1 30); do
             curl -sf http://localhost:11434/api/tags && break
             sleep 1
           done
+      - name: Save Ollama binary cache
+        # Same reasoning as the model cache below: save immediately after
+        # confirming ollama serve works, not deferred to job post-cleanup,
+        # since run_all.py cancels this run on every session and a
+        # cancelled job's post-steps don't get much grace time.
+        if: steps.cache-ollama-bin.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /usr/local/bin/ollama
+            /usr/local/lib/ollama
+          key: ollama-bin-linux-v1
       - name: Restore Ollama model cache
         id: cache-ollama
         uses: actions/cache/restore@v4

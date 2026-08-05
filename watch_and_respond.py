@@ -49,6 +49,13 @@ STATUS_API_URL = f"https://api.github.com/repos/{REPO}/contents/{STATUS_FILE}"
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "qwen2.5:3b"
 
+# Ollama defaults num_predict (max generated tokens) to 128 unless told
+# otherwise, which is why replies felt clipped -- this gives real replies
+# room to actually finish a thought. The warm-up ping stays separately
+# capped (see announce_ready) so it doesn't slow down startup.
+REPLY_MAX_TOKENS = 500
+GENERATE_TIMEOUT_S = 240  # CPU-only runner + longer replies can take a while
+
 POLL_SECONDS = 1
 QUIET_SECONDS = 5  # required pause before we respond
 
@@ -92,16 +99,16 @@ def ask_qwen(text: str, max_tokens: int | None = None) -> str:
     payload = {"model": MODEL, "prompt": text, "stream": False}
     if max_tokens is not None:
         # caps generation length -- keeps the readiness warm-up fast on
-        # a CPU-only runner; real replies still run uncapped
+        # a CPU-only runner; real replies pass REPLY_MAX_TOKENS instead
         payload["options"] = {"num_predict": max_tokens}
-    resp = requests.post(OLLAMA_URL, json=payload, timeout=120)
+    resp = requests.post(OLLAMA_URL, json=payload, timeout=GENERATE_TIMEOUT_S)
     resp.raise_for_status()
     return resp.json().get("response", "").strip()
 
 
-def tts_base64(text: str) -> str:
-    tmp_path = "/tmp/reply.mp3"
-    gTTS(text=text).save(tmp_path)
+def tts_base64(text: str, lang: str = "en") -> str:
+    tmp_path = f"/tmp/reply_{lang}.mp3"
+    gTTS(text=text, lang=lang).save(tmp_path)
     with open(tmp_path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
 
@@ -144,7 +151,7 @@ def announce_ready():
         t0 = time.time()
         ask_qwen("Say 'ready'.", max_tokens=5)
         print(f"[ready] warm-up call answered in {time.time() - t0:.1f}s", flush=True)
-        audio_b64 = tts_base64("I'm ready, go ahead.")
+        audio_b64 = tts_base64("I'm ready, go ahead.", lang="en")
         print("[ready] TTS generated.", flush=True)
     except Exception as e:
         print(f"[ready] warm-up call failed, pushing text-only ready signal: {e}", flush=True)
@@ -204,9 +211,9 @@ def main():
                 print(f"Responding to: {text[:60]!r}", flush=True)
                 try:
                     t0 = time.time()
-                    reply = ask_qwen(text)
+                    reply = ask_qwen(text, max_tokens=REPLY_MAX_TOKENS)
                     print(f"  generated in {time.time() - t0:.1f}s: {reply[:60]!r}", flush=True)
-                    audio_b64 = tts_base64(reply)
+                    audio_b64 = tts_base64(reply, lang="en")
                 except Exception as e:
                     print(f"Failed on entry: {e}", flush=True)
                     continue
