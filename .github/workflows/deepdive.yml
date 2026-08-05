@@ -1,0 +1,627 @@
+name: Local AI Model Deep-Dive (Tool-Capable Finalists)
+
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: "Comma-separated Ollama model tags — defaults to the 7 models that scored 3/3 on tool-calling in the last bake-off"
+        type: string
+        default: "gpt-oss:20b,hermes3:8b,llama3.1:8b,mistral:7b,qwen2.5:3b,qwen2.5:7b,qwen3:4b"
+      max_tokens:
+        description: "Max tokens per generation — higher than the bake-off since these need room to write full docx/html content"
+        type: string
+        default: "700"
+      per_model_timeout_sec:
+        description: "Soft cap (seconds) on the speed-benchmark loop before moving to the tool/artifact suite"
+        type: string
+        default: "1800"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Build model matrix from input
+        id: set-matrix
+        run: |
+          CLEAN=$(echo "${{ inputs.models }}" | tr -d ' \n')
+          JSON=$(python3 -c "
+          import json, sys
+          models = [m for m in sys.argv[1].split(',') if m]
+          print(json.dumps(models))
+          " "$CLEAN")
+          echo "matrix=$JSON" >> "$GITHUB_OUTPUT"
+          echo "Model matrix: $JSON"
+
+  # Only 7 models now, so every job runs fully in parallel with no queuing
+  # (well under the 20-concurrent-job default limit) and each gets a whole
+  # runner — plenty of RAM/disk headroom even for gpt-oss:20b.
+  benchmark:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        model: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Sanitize model name for artifact naming
+        id: safe-name
+        run: |
+          SAFE=$(echo "${{ matrix.model }}" | tr ':/' '--')
+          echo "name=$SAFE" >> "$GITHUB_OUTPUT"
+
+      - name: Free disk space (light cleanup, cheap insurance)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          sudo docker image prune --all --force || true
+          df -h / | tail -1
+
+      - name: Install Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama --version
+
+      - name: Install Python deps (psutil for RAM tracking, python-docx for real .docx generation)
+        run: python3 -m pip install --quiet --user psutil python-docx
+
+      - name: Start Ollama server in background
+        run: |
+          nohup ollama serve > /tmp/ollama.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -s http://localhost:11434 > /dev/null && break
+            sleep 1
+          done
+          curl -s http://localhost:11434
+          free -h
+
+      - name: Pull this runner's model
+        run: |
+          echo "=== Pulling ${{ matrix.model }} ==="
+          ollama pull "${{ matrix.model }}" || echo "::warning::Pull failed for ${{ matrix.model }}"
+          df -h / | tail -1
+          ollama list
+
+      - name: Write speed-benchmark prompt set
+        run: |
+          mkdir -p /tmp/bench /tmp/bench/generated
+          cat > /tmp/bench/prompts.json << 'EOF'
+          [
+            {"category": "factual",   "prompt": "What is the capital of France? Answer in one sentence."},
+            {"category": "reasoning", "prompt": "If a train leaves at 2pm going 60mph and another leaves at 3pm going 90mph on the same route, when does the second train catch up? Show your work briefly."},
+            {"category": "coding",    "prompt": "Write a Python function that returns the nth Fibonacci number using memoization."},
+            {"category": "instruction_following", "prompt": "List exactly 5 fruits, one per line, numbered 1 through 5, nothing else."}
+          ]
+          EOF
+
+      - name: Write agentic tool/artifact test suite
+        run: |
+          cat > /tmp/bench/tool_tests.json << 'EOF'
+          [
+            {
+              "name": "basic_tool_call_weather",
+              "mode": "roundtrip",
+              "system": "You are a helpful assistant with access to tools. Use a tool when appropriate, then answer the user's question in plain language using the tool result.",
+              "user": "What's the weather like in Paris right now? Give me a one-sentence answer.",
+              "tools": [
+                {
+                  "type": "function",
+                  "function": {
+                    "name": "get_current_weather",
+                    "description": "Get the current weather for a location",
+                    "parameters": {
+                      "type": "object",
+                      "properties": {
+                        "location": {"type": "string", "description": "City name"},
+                        "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                      },
+                      "required": ["location"]
+                    }
+                  }
+                }
+              ],
+              "expect_function": "get_current_weather",
+              "expect_arg_substring": {"location": "paris"}
+            },
+            {
+              "name": "data_pull_financials",
+              "mode": "roundtrip",
+              "system": "You are a financial research assistant with access to tools. Use them to look up data, then summarize your findings for the user in one short paragraph.",
+              "user": "Look up ACME Corp's (ticker: ACME) latest quarterly financials and give me a short summary of how they did.",
+              "tools": [
+                {
+                  "type": "function",
+                  "function": {
+                    "name": "get_company_financials",
+                    "description": "Get the latest quarterly financial figures for a company",
+                    "parameters": {
+                      "type": "object",
+                      "properties": {
+                        "ticker": {"type": "string", "description": "Stock ticker symbol"}
+                      },
+                      "required": ["ticker"]
+                    }
+                  }
+                }
+              ],
+              "expect_function": "get_company_financials",
+              "expect_arg_substring": {"ticker": "acme"}
+            },
+            {
+              "name": "create_docx_report",
+              "mode": "artifact_docx",
+              "system": "You are an assistant that helps create documents. You have a tool called create_docx that generates a Word document. Use it whenever the user asks for a document, report, or written file to be created.",
+              "user": "Create a short one-page status report titled 'Q3 Budget Review' covering: budget was cut 10%, hiring is paused, and the team is prioritizing the top 3 features for next quarter. Use the create_docx tool.",
+              "tools": [
+                {
+                  "type": "function",
+                  "function": {
+                    "name": "create_docx",
+                    "description": "Create a Word document with a title and body content",
+                    "parameters": {
+                      "type": "object",
+                      "properties": {
+                        "title": {"type": "string"},
+                        "content": {"type": "string"}
+                      },
+                      "required": ["title", "content"]
+                    }
+                  }
+                }
+              ],
+              "expect_function": "create_docx",
+              "expect_arg_substring": {"title": "budget"}
+            },
+            {
+              "name": "create_html_landing_page",
+              "mode": "artifact_html",
+              "system": "You are an assistant that helps build simple web pages. You have a tool called create_html_page that generates an HTML page. Use it whenever the user asks for a page, site, or HTML file to be created.",
+              "user": "Create a simple HTML landing page titled 'Team Retro Notes' with a heading and a bulleted list of 3 example action items from a sprint retro. Use the create_html_page tool.",
+              "tools": [
+                {
+                  "type": "function",
+                  "function": {
+                    "name": "create_html_page",
+                    "description": "Create an HTML page with a title and body content",
+                    "parameters": {
+                      "type": "object",
+                      "properties": {
+                        "title": {"type": "string"},
+                        "body_html": {"type": "string", "description": "HTML markup for the page body"}
+                      },
+                      "required": ["title", "body_html"]
+                    }
+                  }
+                }
+              ],
+              "expect_function": "create_html_page",
+              "expect_arg_substring": {"title": "retro"}
+            },
+            {
+              "name": "should_not_call_tool",
+              "mode": "scored",
+              "system": "You are a helpful assistant with access to tools. Only use a tool when the user's request actually needs it.",
+              "user": "What is 12 plus 30?",
+              "tools": [
+                {
+                  "type": "function",
+                  "function": {
+                    "name": "get_current_weather",
+                    "description": "Get the current weather for a location",
+                    "parameters": {
+                      "type": "object",
+                      "properties": {"location": {"type": "string"}},
+                      "required": ["location"]
+                    }
+                  }
+                }
+              ],
+              "expect_function": null,
+              "expect_arg_substring": null
+            }
+          ]
+          EOF
+
+      - name: Run speed benchmark + agentic tool/artifact suite
+        run: |
+          cat > /tmp/bench/run.py << 'PYEOF'
+          import json, time, subprocess, os, csv, threading, re
+          import urllib.request
+          import psutil
+          from docx import Document
+
+          MODEL = os.environ["MODEL"]
+          MAX_TOKENS = int(os.environ["MAX_TOKENS"])
+          PER_MODEL_TIMEOUT = int(os.environ["PER_MODEL_TIMEOUT"])
+          GEN_DIR = "/tmp/bench/generated"
+
+          with open("/tmp/bench/prompts.json") as f:
+              PROMPTS = json.load(f)
+          with open("/tmp/bench/tool_tests.json") as f:
+              TOOL_TESTS = json.load(f)
+
+          # ---------------- speed benchmark (same as the bake-off) ----------------
+
+          def get_model_disk_size_mb(model):
+              out = subprocess.run(["ollama", "list"], capture_output=True, text=True).stdout
+              for line in out.splitlines()[1:]:
+                  if not line.strip() or line.split()[0] != model:
+                      continue
+                  m = re.search(r"([\d.]+)\s*(GB|MB)", line, re.IGNORECASE)
+                  if not m:
+                      return None
+                  value, unit = float(m.group(1)), m.group(2).upper()
+                  return round(value * 1024 if unit == "GB" else value, 1)
+              return None
+
+          DISK_SIZE_MB = get_model_disk_size_mb(MODEL)
+
+          class RamSampler:
+              def __init__(self, interval=0.2):
+                  self.interval = interval
+                  self.samples = []
+                  self._stop = threading.Event()
+                  self._thread = None
+
+              def _run(self):
+                  while not self._stop.is_set():
+                      self.samples.append(psutil.virtual_memory().used / (1024 * 1024))
+                      time.sleep(self.interval)
+
+              def start(self):
+                  self.samples = []
+                  self._stop.clear()
+                  self._thread = threading.Thread(target=self._run, daemon=True)
+                  self._thread.start()
+
+              def stop(self):
+                  self._stop.set()
+                  if self._thread:
+                      self._thread.join(timeout=2)
+                  return self.samples
+
+          def call_generate(model, prompt, max_tokens):
+              payload = json.dumps({
+                  "model": model, "prompt": prompt, "stream": False,
+                  "options": {"num_predict": max_tokens}
+              }).encode()
+              req = urllib.request.Request(
+                  "http://localhost:11434/api/generate", data=payload,
+                  headers={"Content-Type": "application/json"}
+              )
+              sampler = RamSampler()
+              baseline = psutil.virtual_memory().used / (1024 * 1024)
+              sampler.start()
+              start = time.time()
+              try:
+                  with urllib.request.urlopen(req, timeout=240) as resp:
+                      body = json.loads(resp.read())
+                  err = None
+              except Exception as e:
+                  body, err = None, str(e)
+              elapsed = time.time() - start
+              samples = sampler.stop()
+              peak = max(samples) if samples else baseline
+              return body, elapsed, err, round(peak, 1), round(peak - baseline, 1)
+
+          results = []
+          check = subprocess.run(["ollama", "list"], capture_output=True, text=True)
+          model_present = MODEL in check.stdout
+
+          if not model_present:
+              results.append({"model": MODEL, "category": "N/A", "trial": 1, "prompt": "",
+                               "elapsed_sec": None, "error": "pull_failed_or_missing",
+                               "output": "", "tokens_generated": 0, "tokens_per_sec": None,
+                               "peak_ram_mb": None, "ram_delta_mb": None, "disk_size_mb": DISK_SIZE_MB})
+          else:
+              model_start = time.time()
+              for p in PROMPTS:
+                  if time.time() - model_start > PER_MODEL_TIMEOUT:
+                      break
+                  print(f"  [speed] {p['category']}...", flush=True)
+                  body, elapsed, err, peak_ram, ram_delta = call_generate(MODEL, p["prompt"], MAX_TOKENS)
+                  row = {"model": MODEL, "category": p["category"], "trial": 1, "prompt": p["prompt"],
+                         "elapsed_sec": round(elapsed, 3), "error": err,
+                         "peak_ram_mb": peak_ram, "ram_delta_mb": ram_delta, "disk_size_mb": DISK_SIZE_MB}
+                  if body and not err:
+                      out_text = body.get("response", "").strip()
+                      eval_count = body.get("eval_count", 0)
+                      eval_ns = body.get("eval_duration", 0)
+                      tok_s = (eval_count / (eval_ns / 1e9)) if eval_ns else None
+                      row.update({"output": out_text[:800], "tokens_generated": eval_count,
+                                  "tokens_per_sec": round(tok_s, 2) if tok_s else None})
+                  else:
+                      row.update({"output": "", "tokens_generated": 0, "tokens_per_sec": None})
+                  results.append(row)
+
+          # ---------------- agentic tool / artifact suite ----------------
+
+          def call_chat(messages, tools=None):
+              payload = {"model": MODEL, "messages": messages, "stream": False,
+                         "options": {"num_predict": MAX_TOKENS}}
+              if tools:
+                  payload["tools"] = tools
+              req = urllib.request.Request(
+                  "http://localhost:11434/api/chat", data=json.dumps(payload).encode(),
+                  headers={"Content-Type": "application/json"}
+              )
+              start = time.time()
+              try:
+                  with urllib.request.urlopen(req, timeout=240) as resp:
+                      body = json.loads(resp.read())
+                  err = None
+              except Exception as e:
+                  body, err = None, str(e)
+              return body, time.time() - start, err
+
+          def score_tool_call(body, test):
+              if not body:
+                  return False, False, False, "no response body", None
+              msg = body.get("message", {})
+              tool_calls = msg.get("tool_calls") or []
+              called = len(tool_calls) > 0
+              if test["expect_function"] is None:
+                  correct = not called
+                  return called, correct, correct, (
+                      "correctly avoided calling a tool" if correct
+                      else "incorrectly called a tool when it shouldn't have"), None
+              if not called:
+                  return False, False, False, "model did not call any tool", None
+              fn = tool_calls[0].get("function", {})
+              fn_name = fn.get("name", "")
+              correct_fn = fn_name == test["expect_function"]
+              args = fn.get("arguments", {})
+              if isinstance(args, str):
+                  try:
+                      args = json.loads(args)
+                  except Exception:
+                      args = {}
+              correct_args = True
+              if test["expect_arg_substring"]:
+                  for k, expected_sub in test["expect_arg_substring"].items():
+                      if expected_sub not in str(args.get(k, "")).lower():
+                          correct_args = False
+              return called, correct_fn, correct_args, f"called {fn_name} with args {args}", args
+
+          def mock_execute_tool(name, args):
+              if name == "get_current_weather":
+                  return {"location": args.get("location", "the requested city"),
+                           "temperature_c": 18, "condition": "partly cloudy", "humidity_pct": 62}
+              if name == "get_company_financials":
+                  return {"ticker": args.get("ticker", "ACME"), "quarter": "Q2 2026",
+                           "revenue_usd_millions": 482, "net_income_usd_millions": 37,
+                           "yoy_growth_pct": 12.4}
+              return {"status": "ok"}
+
+          os.makedirs(GEN_DIR, exist_ok=True)
+          tool_results = []
+
+          if model_present:
+              for test in TOOL_TESTS:
+                  messages = [{"role": "system", "content": test["system"]},
+                              {"role": "user", "content": test["user"]}]
+                  body, elapsed, err = call_chat(messages, tools=test["tools"])
+                  called, correct_fn, correct_args, notes, args = (
+                      score_tool_call(body, test) if not err else (False, False, False, err, None)
+                  )
+                  row = {"model": MODEL, "test_name": test["name"], "mode": test["mode"],
+                         "elapsed_sec": round(elapsed, 3), "called_tool": called,
+                         "correct_function": correct_fn, "correct_args": correct_args,
+                         "passed": correct_fn and correct_args, "notes": notes, "error": err,
+                         "generated_file": None, "final_answer": None}
+
+                  if called and correct_fn and args is not None:
+                      fn_name = test["tools"][0]["function"]["name"]
+
+                      if test["mode"] == "roundtrip":
+                          tool_result = mock_execute_tool(fn_name, args)
+                          assistant_msg = body["message"]
+                          followup = messages + [
+                              assistant_msg,
+                              {"role": "tool", "name": fn_name, "content": json.dumps(tool_result)},
+                          ]
+                          final_body, felapsed, ferr = call_chat(followup)
+                          final_text = ""
+                          if final_body and not ferr:
+                              final_text = final_body.get("message", {}).get("content", "").strip()
+                          row["final_answer"] = final_text[:1500]
+                          fname = f"{test['name']}.txt"
+                          with open(os.path.join(GEN_DIR, fname), "w") as f:
+                              f.write(f"Tool call args: {json.dumps(args)}\n")
+                              f.write(f"Mock tool result: {json.dumps(tool_result)}\n\n")
+                              f.write(f"Model's final answer:\n{final_text}\n")
+                          row["generated_file"] = fname
+
+                      elif test["mode"] == "artifact_docx":
+                          title = args.get("title", "Untitled Report")
+                          content = args.get("content", "")
+                          doc = Document()
+                          doc.add_heading(title, level=0)
+                          for para in content.split("\n"):
+                              if para.strip():
+                                  doc.add_paragraph(para.strip())
+                          doc.save(os.path.join(GEN_DIR, "report.docx"))
+                          row["generated_file"] = "report.docx"
+
+                      elif test["mode"] == "artifact_html":
+                          title = args.get("title", "Untitled Page")
+                          body_html = args.get("body_html", "")
+                          html = (f"<!DOCTYPE html>\n<html><head><meta charset='utf-8'>"
+                                  f"<title>{title}</title></head>\n<body>\n{body_html}\n</body></html>")
+                          with open(os.path.join(GEN_DIR, "page.html"), "w") as f:
+                              f.write(html)
+                          row["generated_file"] = "page.html"
+
+                  tool_results.append(row)
+
+          # ---------------- write results ----------------
+
+          with open("/tmp/bench/raw_results.json", "w") as f:
+              json.dump(results, f, indent=2)
+          with open("/tmp/bench/tool_results.json", "w") as f:
+              json.dump(tool_results, f, indent=2)
+          with open("/tmp/bench/tool_results.csv", "w", newline="") as f:
+              fieldnames = ["model","test_name","mode","elapsed_sec","called_tool","correct_function",
+                            "correct_args","passed","notes","error","generated_file","final_answer"]
+              w = csv.DictWriter(f, fieldnames=fieldnames)
+              w.writeheader()
+              for r in tool_results:
+                  w.writerow(r)
+
+          speeds = [r["tokens_per_sec"] for r in results if r.get("tokens_per_sec")]
+          passed = sum(1 for r in tool_results if r["passed"])
+          summary = {
+              "model": MODEL,
+              "disk_size_mb": DISK_SIZE_MB,
+              "avg_tokens_per_sec": round(sum(speeds) / len(speeds), 2) if speeds else None,
+              "tool_use_pass_rate": f"{passed}/{len(tool_results)}" if tool_results else "N/A",
+              "generated_files": [r["generated_file"] for r in tool_results if r["generated_file"]],
+          }
+          with open("/tmp/bench/model_summary.json", "w") as f:
+              json.dump(summary, f, indent=2)
+          print("\n" + json.dumps(summary, indent=2))
+          PYEOF
+
+          MODEL="${{ matrix.model }}" \
+          MAX_TOKENS="${{ inputs.max_tokens }}" \
+          PER_MODEL_TIMEOUT="${{ inputs.per_model_timeout_sec }}" \
+            python3 /tmp/bench/run.py
+
+      - name: Upload this model's results and generated files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepdive-${{ steps.safe-name.outputs.name }}
+          path: |
+            /tmp/bench/raw_results.json
+            /tmp/bench/tool_results.json
+            /tmp/bench/tool_results.csv
+            /tmp/bench/model_summary.json
+            /tmp/bench/generated/**
+          retention-days: 14
+
+  merge:
+    needs: benchmark
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all per-model artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deepdive-*
+          path: /tmp/artifacts
+
+      - name: Install python-docx for reading generated docx back out
+        run: python3 -m pip install --quiet --user python-docx
+
+      - name: Merge into final report (with embedded outputs)
+        run: |
+          mkdir -p /tmp/merged
+          cat > /tmp/merge.py << 'PYEOF'
+          import json, glob, os, shutil
+          from docx import Document
+
+          all_tools, all_summaries = [], []
+          for d in sorted(glob.glob("/tmp/artifacts/*")):
+              tr_path = os.path.join(d, "tool_results.json")
+              sm_path = os.path.join(d, "model_summary.json")
+              if os.path.exists(tr_path):
+                  with open(tr_path) as f:
+                      all_tools.extend(json.load(f))
+              if os.path.exists(sm_path):
+                  with open(sm_path) as f:
+                      all_summaries.append(json.load(f))
+
+              # copy each model's generated files into a per-model folder in the merged output
+              gen_dir = os.path.join(d, "generated")
+              if os.path.isdir(gen_dir):
+                  model_name = os.path.basename(d).replace("deepdive-", "")
+                  dest = f"/tmp/merged/generated/{model_name}"
+                  os.makedirs(dest, exist_ok=True)
+                  for fname in os.listdir(gen_dir):
+                      shutil.copy(os.path.join(gen_dir, fname), os.path.join(dest, fname))
+
+          all_summaries.sort(key=lambda x: (x["avg_tokens_per_sec"] is None, -(x["avg_tokens_per_sec"] or 0)))
+
+          with open("/tmp/merged/tool_results_all.json", "w") as f:
+              json.dump(all_tools, f, indent=2)
+          with open("/tmp/merged/summary.json", "w") as f:
+              json.dump(all_summaries, f, indent=2)
+
+          lines = []
+          lines.append("# Deep-Dive: Tool-Capable Model Finalists\n")
+          lines.append("## Speed + Tool-Use Summary\n")
+          lines.append("| Model | Disk (MB) | Avg tok/s | Tool-use pass |")
+          lines.append("|---|---|---|---|")
+          for r in all_summaries:
+              lines.append(f"| {r['model']} | {r['disk_size_mb']} | {r['avg_tokens_per_sec']} | {r['tool_use_pass_rate']} |")
+
+          lines.append("\n## Data-Pull Round Trips (tool call → mock data → model's final answer)\n")
+          for r in all_tools:
+              if r["mode"] != "roundtrip":
+                  continue
+              lines.append(f"### {r['model']} — {r['test_name']}")
+              lines.append(f"Passed: {'✅' if r['passed'] else '❌'} | {r['notes']}\n")
+              if r.get("final_answer"):
+                  lines.append(f"> {r['final_answer']}\n")
+
+          lines.append("\n## Generated docx Content (extracted back out for quick reading)\n")
+          for model_dir in sorted(glob.glob("/tmp/merged/generated/*")):
+              model_name = os.path.basename(model_dir)
+              docx_path = os.path.join(model_dir, "report.docx")
+              if os.path.exists(docx_path):
+                  try:
+                      doc = Document(docx_path)
+                      text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+                      lines.append(f"### {model_name}")
+                      lines.append("```")
+                      lines.append(text)
+                      lines.append("```\n")
+                  except Exception as e:
+                      lines.append(f"### {model_name}\n(could not read docx: {e})\n")
+
+          lines.append("\n## Generated HTML Source\n")
+          for model_dir in sorted(glob.glob("/tmp/merged/generated/*")):
+              model_name = os.path.basename(model_dir)
+              html_path = os.path.join(model_dir, "page.html")
+              if os.path.exists(html_path):
+                  with open(html_path) as f:
+                      html = f.read()
+                  lines.append(f"### {model_name}")
+                  lines.append("```html")
+                  lines.append(html)
+                  lines.append("```\n")
+
+          lines.append("\n## Full Tool-Test Detail\n")
+          lines.append("| Model | Test | Mode | Called? | Correct fn? | Correct args? | Passed | File | Notes |")
+          lines.append("|---|---|---|---|---|---|---|---|---|")
+          for r in all_tools:
+              lines.append(f"| {r['model']} | {r['test_name']} | {r['mode']} | {r['called_tool']} | "
+                            f"{r['correct_function']} | {r['correct_args']} | "
+                            f"{'✅' if r['passed'] else '❌'} | {r.get('generated_file') or '-'} | "
+                            f"{str(r['notes'])[:100]} |")
+
+          report = "\n".join(lines)
+          with open("/tmp/merged/report.md", "w") as f:
+              f.write(report)
+          print(report)
+          PYEOF
+          python3 /tmp/merge.py
+
+      - name: Append merged report to job summary
+        if: always()
+        run: cat /tmp/merged/report.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload FINAL merged deep-dive results (includes real .docx / .html files)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-ai-deepdive-FINAL-results
+          path: |
+            /tmp/merged/report.md
+            /tmp/merged/summary.json
+            /tmp/merged/tool_results_all.json
+            /tmp/merged/generated/**
+          retention-days: 30
