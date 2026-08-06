@@ -146,5 +146,11 @@
     "talk_seconds": 0.99,
     "text": "Paula",
     "raw_text": "paula"
+  },
+  {
+    "datetime": "2026-08-05T19:35:36",
+    "talk_seconds": 0.51,
+    "text": "Paul",
+    "raw_text": "paul"
   }
 ]
