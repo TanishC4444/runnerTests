@@ -1,6 +1,6 @@
 """
 Live version: listens continuously, prints a chunk each time you pause, and
-writes each chunk as a JSON entry to chat/Log 1/chunks.json as it happens.
+publishes each chunk as a JSON entry in chat/Log 1/chunks.json as it happens.
 
 Pause detection uses webrtcvad (voice activity detection) with a tunable
 pause length (PAUSE_MS), not Vosk's own built-in endpointer.
@@ -27,38 +27,27 @@ Each printed chunk shows:
   t=            total time since the script started listening
   since last    time since the previous chunk was printed
 
-Each chunk is also appended live to:
+Each chunk is appended through the GitHub API to:
   chat/Log 1/chunks.json
 as {"datetime": ..., "talk_seconds": ..., "text": ..., "raw_text": ...}
 
-NOTE ON SYNCING: the cloud watcher (watch_and_respond.py) writes to this
-same file independently, via the GitHub Contents API, adding "response" /
-"response_audio_b64" fields to entries after the fact. That means two
-things: (1) a plain `git push` here can get rejected as non-fast-forward
-whenever the cloud side has pushed in between, and (2) even after a pull,
-writing from a stale in-memory `entries` list would silently clobber
-whatever the cloud side just added. So before every write we pull AND
-reload from disk, and if the push still gets rejected we pull-rebase and
-retry rather than giving up.
+NOTE ON SYNCING: both this listener and the cloud watcher update the same
+JSON file through GitHub's Contents API. Each update re-fetches the latest
+blob and retries optimistic-lock conflicts, so neither side performs local
+Git commits/rebases or overwrites the other's fields.
 """
 
+import base64
 import json
 import os
 import queue
-import subprocess
 import sys
-import tempfile
 import threading
 import time
-from contextlib import contextmanager
 from datetime import datetime
 
-try:
-    import fcntl
-except ImportError:  # Windows fallback; fcntl is available on macOS/Linux.
-    fcntl = None
-
 import pyaudio
+import requests
 import webrtcvad
 from vosk import Model, KaldiRecognizer
 import language_tool_python
@@ -76,21 +65,19 @@ SHOW_PARTIAL_PREVIEW = True        # set False if your terminal/log doesn't hand
 LOG_DIR = os.path.join("chat", "Log 1")
 LOG_FILE = os.path.join(LOG_DIR, "chunks.json")
 
-PUSH_RETRIES = 3
-GIT_LOCK_FILE = os.path.join(tempfile.gettempdir(), "runnerTests_git_sync.lock")
-
-
-@contextmanager
-def git_sync_lock():
-    """Serialize Git operations with run_all.py across both processes."""
-    with open(GIT_LOCK_FILE, "a+") as lock_file:
-        if fcntl is not None:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            if fcntl is not None:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+TOKEN = os.environ.get("GH_TOKEN")
+REPO = os.environ.get("GITHUB_REPOSITORY", "TanishC4444/runnerTests")
+BRANCH = os.environ.get("GITHUB_REF_NAME", "main")
+FILE_PATH = "chat/Log 1/chunks.json"
+API_URL = f"https://api.github.com/repos/{REPO}/contents/{FILE_PATH}"
+API_TIMEOUT_S = 30
+PUSH_RETRIES = 8
+HEADERS = {
+    "Authorization": f"Bearer {TOKEN}",
+    "Accept": "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "Cache-Control": "no-cache",
+}
 
 
 def fmt(seconds: float) -> str:
@@ -114,61 +101,66 @@ def load_log() -> list:
     return []
 
 
-def save_log(entries: list):
-    os.makedirs(LOG_DIR, exist_ok=True)
-    with open(LOG_FILE, "w") as f:
-        json.dump(entries, f, indent=2)
+def entry_key(entry: dict) -> tuple:
+    return entry.get("datetime"), entry.get("raw_text"), entry.get("talk_seconds")
 
 
-def git_pull_log():
-    """Pull remote changes before we write. The cloud watcher pushes
-    response data to this same file independently, so this is what keeps
-    us from writing on top of a stale local copy."""
-    try:
-        result = subprocess.run(
-            ["git", "pull", "--rebase", "--autostash"],
-            capture_output=True, text=True, timeout=20,
+def fetch_remote_log():
+    response = requests.get(
+        API_URL,
+        headers=HEADERS,
+        params={"ref": BRANCH},
+        timeout=API_TIMEOUT_S,
+    )
+    response.raise_for_status()
+    data = response.json()
+    content = base64.b64decode(data["content"]).decode("utf-8")
+    return json.loads(content) if content.strip() else [], data["sha"]
+
+
+def append_remote_chunk(entry: dict):
+    """Append one chunk without rebasing or overwriting cloud responses."""
+    if not TOKEN:
+        raise RuntimeError("GH_TOKEN is not set")
+
+    key = entry_key(entry)
+    for attempt in range(1, PUSH_RETRIES + 1):
+        entries, sha = fetch_remote_log()
+        if any(entry_key(existing) == key for existing in entries):
+            return
+
+        entries.append(entry)
+        content = base64.b64encode(
+            json.dumps(entries, indent=2).encode("utf-8")
+        ).decode("utf-8")
+        response = requests.put(
+            API_URL,
+            headers=HEADERS,
+            json={
+                "message": "New chunk",
+                "content": content,
+                "sha": sha,
+                "branch": BRANCH,
+            },
+            timeout=API_TIMEOUT_S,
         )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout).strip()
-            print(f"[git] pull failed (continuing with local copy): {detail}")
-    except Exception as e:
-        print(f"[git] pull failed (continuing with local copy): {e}")
-
-
-def git_push_log(retries: int = PUSH_RETRIES):
-    """Commit + push the log file so the cloud watcher can see it.
-
-    A plain push can get rejected (non-fast-forward) if the cloud watcher
-    pushed in between our pull and our push -- that's a normal race, not
-    an error. On rejection we pull-rebase and retry a few times before
-    giving up (a chunk just waits to sync on the next successful push)."""
-    try:
-        subprocess.run(["git", "add", LOG_FILE], check=True, capture_output=True)
-        result = subprocess.run(
-            ["git", "commit", "-m", "New chunk"], capture_output=True
-        )
-        if result.returncode != 0:
-            return  # nothing to commit
-
-        for attempt in range(1, retries + 1):
-            push = subprocess.run(["git", "push"], capture_output=True, timeout=15)
-            if push.returncode == 0:
-                return
-            print(f"[git] push rejected (attempt {attempt}/{retries}), syncing and retrying...")
-            subprocess.run(
-                ["git", "pull", "--rebase", "--autostash"],
-                capture_output=True, timeout=20,
+        if response.ok:
+            return
+        if response.status_code not in (409, 422):
+            detail = response.text.strip() or "<empty response body>"
+            raise RuntimeError(
+                f"GitHub chunk update failed with HTTP {response.status_code}: "
+                f"{detail[:2000]}"
             )
-        print("[git] push still failing after retries (will retry next chunk)")
-    except Exception as e:
-        print(f"[git] push failed (will retry next chunk): {e}")
+        print(f"[sync] file changed; retrying append ({attempt}/{PUSH_RETRIES})")
+
+    raise RuntimeError("chunk append kept conflicting after all retries")
 
 
 def worker_loop(work_q: "queue.Queue", tool, t_start: float):
     """Runs on a background thread: does the slow stuff (grammar correction,
-    git sync, disk write, printing) so the mic-reading loop never has to
-    wait on it."""
+    remote append, and printing) so the mic-reading loop never waits on it."""
+    pending = []
     while True:
         item = work_q.get()
         if item is None:
@@ -184,25 +176,25 @@ def worker_loop(work_q: "queue.Queue", tool, t_start: float):
             sys.stdout.write("\r" + " " * 80 + "\r")
         print(f"[t={fmt(elapsed)} | +{fmt(since_last)} since last]  {fixed}{tag}")
 
-        # Sync first, then reload from disk -- never trust an in-memory
-        # copy here, since the cloud watcher may have added response
-        # fields to earlier entries since we last looked.
-        # Keep pull -> reload -> write -> commit -> push atomic relative to
-        # run_all.py's background pulls. Concurrent Git commands previously
-        # left an interrupted rebase that blocked every later sync.
-        with git_sync_lock():
-            git_pull_log()
-            entries = load_log()
-
-            entry = {
-                "datetime": datetime.now().isoformat(timespec="seconds"),
+        pending.append(
+            {
+                "datetime": datetime.now().isoformat(timespec="microseconds"),
                 "talk_seconds": round(talk_seconds, 2),
                 "text": fixed,
                 "raw_text": raw_text,
             }
-            entries.append(entry)
-            save_log(entries)
-            git_push_log()
+        )
+
+        # Retain failed entries in memory and flush them in order on the next
+        # chunk. append_remote_chunk is idempotent, so ambiguous retries are safe.
+        while pending:
+            try:
+                append_remote_chunk(pending[0])
+                print("[sync] chunk appended")
+                pending.pop(0)
+            except Exception as e:
+                print(f"[sync] chunk append failed; will retry: {e}")
+                break
 
 
 def live_split():
@@ -225,7 +217,7 @@ def live_split():
     stream.start_stream()
 
     entries = load_log()
-    print(f"Logging to {LOG_FILE} ({len(entries)} existing entries)")
+    print(f"Publishing to {LOG_FILE} ({len(entries)} entries in local mirror)")
     print(f"Listening... a {PAUSE_MS}ms pause ends a chunk. Ctrl+C to stop.")
     print("Type 'm' + Enter at any time to mute/unmute.\n")
 
