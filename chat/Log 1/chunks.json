@@ -110,5 +110,11 @@
     "talk_seconds": 3.99,
     "text": "Hey how are you doing are we ready to get started",
     "raw_text": "hey how are you doing are we ready to get started"
+  },
+  {
+    "datetime": "2026-08-05T19:35:10",
+    "talk_seconds": 1.86,
+    "text": "Then my get poll fail",
+    "raw_text": "then my get poll fail"
   }
 ]
