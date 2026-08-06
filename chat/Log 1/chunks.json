@@ -164,5 +164,11 @@
     "talk_seconds": 1.95,
     "text": "Are you there are you listening to me now",
     "raw_text": "are you there are you listening to me now"
+  },
+  {
+    "datetime": "2026-08-05T19:41:33",
+    "talk_seconds": 1.29,
+    "text": "Can you hear me",
+    "raw_text": "can you hear me"
   }
 ]
