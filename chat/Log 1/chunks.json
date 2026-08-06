@@ -86,5 +86,11 @@
     "talk_seconds": 1.8,
     "text": "Will you ever talk back",
     "raw_text": "will you ever talk back"
+  },
+  {
+    "datetime": "2026-08-05T19:24:26",
+    "talk_seconds": 1.32,
+    "text": "How are you doing",
+    "raw_text": "how are you doing"
   }
 ]
