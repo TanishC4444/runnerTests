@@ -22,6 +22,7 @@ Stops only when the job is cancelled (by you, via the cancel-run API) or
 the workflow's own timeout is hit.
 """
 
+import asyncio
 import base64
 import json
 import os
@@ -30,14 +31,19 @@ import sys
 import time
 
 import requests
-from gtts import gTTS
+import edge_tts
 
 # GitHub Actions doesn't attach a TTY to step output, so Python buffers
 # stdout by default -- prints can sit invisible for a long time instead
 # of showing up as they happen. Force line buffering so the log is live.
 sys.stdout.reconfigure(line_buffering=True)
 
-print(f"[deps] requests {requests.__version__}, gTTS import OK", flush=True)
+print(f"[deps] requests {requests.__version__}, edge_tts import OK", flush=True)
+
+# Jarvis-ish: calm, deep, British male voice. Full voice list: `edge-tts --list-voices`.
+# Other reasonable picks: "en-GB-ThomasNeural" (younger/brisker), "en-US-GuyNeural" (American).
+TTS_VOICE = "en-GB-RyanNeural"
+TTS_RATE = "+18%"   # you asked for faster-than-default speech; tune this to taste
 
 TOKEN = os.environ["GH_TOKEN"]
 REPO = os.environ["GITHUB_REPOSITORY"]  # "owner/repo"
@@ -213,9 +219,16 @@ def ask_qwen(text: str, max_tokens: int | None = None) -> str:
     return reply
 
 
+async def _edge_tts_save(text: str, path: str) -> None:
+    communicate = edge_tts.Communicate(text, voice=TTS_VOICE, rate=TTS_RATE)
+    await communicate.save(path)
+
+
 def tts_base64(text: str, lang: str = "en") -> str:
+    """lang kept in the signature so call sites don't need to change;
+    voice/rate/accent are controlled by TTS_VOICE/TTS_RATE above instead."""
     tmp_path = f"/tmp/reply_{lang}.mp3"
-    gTTS(text=text, lang=lang).save(tmp_path)
+    asyncio.run(_edge_tts_save(text, tmp_path))
     with open(tmp_path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
 

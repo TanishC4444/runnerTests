@@ -82,8 +82,8 @@ jobs:
           python-version: "3.11"
       - name: Install Python deps
         run: |
-          pip install requests gTTS
-          python -c "import requests, gtts; print('requests', requests.__version__); print('gTTS OK, module at', gtts.__file__)"
+          pip install requests edge-tts
+          python -c "import requests, edge_tts; print('requests', requests.__version__); print('edge_tts OK, module at', edge_tts.__file__)"
       - name: Run watcher loop
         env:
           GH_TOKEN: ${{ secrets.RUNNER_PAT }}

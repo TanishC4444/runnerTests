@@ -18,6 +18,7 @@ Setup:
 """
 
 import base64
+import http.server
 import json
 import os
 import platform
@@ -53,6 +54,35 @@ LISTENER_SCRIPT = "live_split_on_pauses.py"
 READY_TIMEOUT_S = 240  # generous: cold model pull + Ollama boot can be slow
 RESPONSE_POLL_SECONDS = 3
 GIT_LOCK_FILE = os.path.join(tempfile.gettempdir(), "runnerTests_git_sync.lock")
+
+# Same path live_split_on_pauses.py writes to. Local-only IPC, never touches
+# Git -- this is what makes barge-in and the dashboard possible without
+# changing anything about how the cloud side works.
+LOCAL_STATUS_FILE = os.path.join(tempfile.gettempdir(), "jarvis_local_status.json")
+DASHBOARD_PORT = 8765
+# How aggressively the playback watcher checks "did the user start talking
+# yet". 80ms feels effectively instant without busy-looping the CPU.
+BARGE_IN_POLL_S = 0.08
+
+
+def _read_local_status() -> dict:
+    try:
+        with open(LOCAL_STATUS_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _write_local_status(**fields):
+    data = _read_local_status()
+    data.update(fields)
+    try:
+        tmp_path = LOCAL_STATUS_FILE + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp_path, LOCAL_STATUS_FILE)
+    except Exception:
+        pass
 
 
 @contextmanager
@@ -116,25 +146,141 @@ def reset_status():
     resp.raise_for_status()
 
 
-def play_audio(path: str):
+def _players_for_platform(path: str):
     system = platform.system()
+    if system == "Darwin":
+        return [["afplay", path]]
+    if system == "Linux":
+        return [["mpg123", path], ["ffplay", "-nodisp", "-autoexit", path], ["aplay", path]]
+    if system == "Windows":
+        # ffplay is the only one of these that gives us a killable child
+        # process on Windows; os.startfile() opens a detached default
+        # player we have no handle to, so barge-in can't stop it.
+        return [["ffplay", "-nodisp", "-autoexit", path]]
+    return []
+
+
+def play_audio_interruptible(path: str, session_start_ts: float) -> bool:
+    """Plays audio locally, but kills it the instant the mic hears you speak.
+
+    Returns True if playback finished on its own, False if it was cut short
+    by barge-in. `session_start_ts` filters out stale/old speech-onset
+    events already sitting in the status file from before this reply started.
+    """
+    proc = None
+    for player_cmd in _players_for_platform(path):
+        try:
+            proc = subprocess.Popen(
+                player_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            break
+        except FileNotFoundError:
+            continue
+
+    if proc is None:
+        print("[audio] no usable player found, skipping playback")
+        return True
+
     try:
-        if system == "Darwin":
-            subprocess.run(["afplay", path], check=True)
-        elif system == "Linux":
-            for player in (["mpg123", path], ["ffplay", "-nodisp", "-autoexit", path], ["aplay", path]):
+        while proc.poll() is None:
+            status = _read_local_status()
+            if (
+                status.get("mic_state") == "speech"
+                and status.get("mic_state_ts", 0) > session_start_ts
+            ):
+                print("[barge-in] you started talking -- cutting playback")
+                proc.terminate()
                 try:
-                    subprocess.run(player, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    return
-                except (FileNotFoundError, subprocess.CalledProcessError):
-                    continue
-            print("[audio] no player found (tried mpg123/ffplay/aplay), skipping playback")
-        elif system == "Windows":
-            os.startfile(path)  # opens default player
-        else:
-            print(f"[audio] unrecognized platform {system!r}, skipping playback")
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                return False
+            time.sleep(BARGE_IN_POLL_S)
+        return True
     except Exception as e:
         print(f"[audio] playback failed: {e}")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return True
+
+
+# --- Dashboard: a small local HTTP server so you can watch Jarvis's state
+# (listening / thinking / speaking) live in a browser tab. Pure read-only
+# view of LOCAL_STATUS_FILE -- no Git, no polling the cloud.
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Jarvis</title>
+<style>
+  body { background:#05070c; color:#cfe8ff; font-family:'SF Mono',Consolas,monospace;
+         display:flex; flex-direction:column; align-items:center; padding-top:8vh; }
+  #orb { width:140px; height:140px; border-radius:50%; margin-bottom:28px;
+         background:radial-gradient(circle at 35% 30%, #8fd8ff, #0a84ff 55%, #002347);
+         box-shadow:0 0 40px 10px rgba(10,132,255,0.35); transition:box-shadow .25s, transform .25s; }
+  #orb.thinking { background:radial-gradient(circle at 35% 30%, #ffe28f, #ff9d0a 55%, #4a2900);
+                  box-shadow:0 0 40px 10px rgba(255,157,10,0.4); animation:pulse 1s infinite; }
+  #orb.speaking { animation:pulse .5s infinite; box-shadow:0 0 55px 16px rgba(10,132,255,0.55); }
+  #orb.muted { background:#2a2f3a; box-shadow:none; }
+  @keyframes pulse { 0%,100%{transform:scale(1);} 50%{transform:scale(1.08);} }
+  #state { font-size:1.3em; letter-spacing:.15em; text-transform:uppercase; color:#7fb8ff; margin-bottom:36px; }
+  .row { width:min(640px,88vw); margin-bottom:18px; }
+  .label { font-size:.75em; letter-spacing:.1em; text-transform:uppercase; color:#4a6a8f; margin-bottom:6px; }
+  .text { font-size:1.05em; line-height:1.5; min-height:1.5em; color:#e6f2ff; }
+</style></head>
+<body>
+  <div id="orb"></div>
+  <div id="state">idle</div>
+  <div class="row"><div class="label">You said</div><div class="text" id="user_text">&mdash;</div></div>
+  <div class="row"><div class="label">Jarvis</div><div class="text" id="reply_text">&mdash;</div></div>
+<script>
+async function tick() {
+  try {
+    const r = await fetch('/status', {cache: 'no-store'});
+    const s = await r.json();
+    const orb = document.getElementById('orb');
+    const stateEl = document.getElementById('state');
+    let label = s.conv_state || 'idle';
+    if (s.mic_state === 'muted') label = 'muted';
+    orb.className = label;
+    stateEl.textContent = label;
+    document.getElementById('user_text').textContent = s.last_user_text || '\\u2014';
+    document.getElementById('reply_text').textContent = s.last_reply_text || '\\u2014';
+  } catch (e) {}
+  setTimeout(tick, 250);
+}
+tick();
+</script>
+</body></html>"""
+
+
+class _DashboardHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass  # keep the console clean; the dashboard doesn't need per-request logs
+
+    def do_GET(self):
+        if self.path.startswith("/status"):
+            body = json.dumps(_read_local_status()).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            body = DASHBOARD_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+
+def start_dashboard_server() -> http.server.ThreadingHTTPServer:
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", DASHBOARD_PORT), _DashboardHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"[dashboard] http://localhost:{DASHBOARD_PORT}")
+    return server
 
 
 def wait_for_ready(timeout_s: int = READY_TIMEOUT_S):
@@ -159,7 +305,7 @@ def wait_for_ready(timeout_s: int = READY_TIMEOUT_S):
                 tmp_path = os.path.join(tempfile.gettempdir(), "qwen_ready.mp3")
                 with open(tmp_path, "wb") as f:
                     f.write(base64.b64decode(audio_b64))
-                play_audio(tmp_path)
+                play_audio_interruptible(tmp_path, session_start_ts=time.time())
             else:
                 print("[cloud] Qwen is ready (no audio cue was included).")
             return
@@ -217,18 +363,31 @@ def response_watcher_loop(stop_event: threading.Event):
 
             reply = entry.get("response", "")
             print(f"[talkback] {reply[:60]!r}")
+            _write_local_status(
+                conv_state="speaking", conv_state_ts=time.time(), last_reply_text=reply
+            )
 
             audio_b64 = entry.get("response_audio_b64")
             if audio_b64:
                 tmp_path = os.path.join(tempfile.gettempdir(), "qwen_reply.mp3")
                 with open(tmp_path, "wb") as f:
                     f.write(base64.b64decode(audio_b64))
-                play_audio(tmp_path)
+                play_audio_interruptible(tmp_path, session_start_ts=time.time())
+
+            _write_local_status(conv_state="idle", conv_state_ts=time.time())
 
         stop_event.wait(RESPONSE_POLL_SECONDS)
 
 
 def main():
+    # Fresh session: clear any stale mic/conv state left from a previous run
+    # before the dashboard starts reading it.
+    try:
+        os.remove(LOCAL_STATUS_FILE)
+    except FileNotFoundError:
+        pass
+    start_dashboard_server()
+
     reset_status()
     trigger_workflow()
 
@@ -257,7 +416,8 @@ def main():
     responder = threading.Thread(target=response_watcher_loop, args=(stop_event,), daemon=True)
     responder.start()
 
-    print("\nReady. Idle until you speak. Ctrl+C to stop everything.\n")
+    print(f"\nReady. Idle until you speak. Dashboard: http://localhost:{DASHBOARD_PORT}")
+    print("Ctrl+C to stop everything.\n")
 
     try:
         while True:

@@ -42,6 +42,7 @@ import json
 import os
 import queue
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -51,6 +52,32 @@ import requests
 import webrtcvad
 from vosk import Model, KaldiRecognizer
 import language_tool_python
+
+# Local-only status file, shared with run_all.py so it can (a) show a live
+# dashboard and (b) know the instant you start talking again, so it can kill
+# playback for barge-in. This never touches Git/GitHub -- it's pure local
+# IPC between the two processes on your machine, written to on VAD state
+# *transitions* only (not every audio frame) so it stays cheap.
+LOCAL_STATUS_FILE = os.path.join(tempfile.gettempdir(), "jarvis_local_status.json")
+
+
+def _write_local_status(**fields):
+    """Atomic read-modify-write against the shared local status file."""
+    try:
+        try:
+            with open(LOCAL_STATUS_FILE, "r") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            data = {}
+        data.update(fields)
+        tmp_path = LOCAL_STATUS_FILE + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp_path, LOCAL_STATUS_FILE)
+    except Exception:
+        # The dashboard/barge-in is a nice-to-have; never let it take down
+        # the actual mic pipeline.
+        pass
 
 MODEL_PATH = "model"
 SAMPLE_RATE = 16000
@@ -184,6 +211,7 @@ def worker_loop(work_q: "queue.Queue", tool, t_start: float):
                 "raw_text": raw_text,
             }
         )
+        _write_local_status(last_user_text=fixed, last_user_ts=time.time())
 
         # Retain failed entries in memory and flush them in order on the next
         # chunk. append_remote_chunk is idempotent, so ambiguous retries are safe.
@@ -192,6 +220,9 @@ def worker_loop(work_q: "queue.Queue", tool, t_start: float):
                 append_remote_chunk(pending[0])
                 print("[sync] chunk appended")
                 pending.pop(0)
+                # Cloud watcher has the chunk now and will start generating --
+                # this is what makes the dashboard show "thinking".
+                _write_local_status(conv_state="thinking", conv_state_ts=time.time())
             except Exception as e:
                 print(f"[sync] chunk append failed; will retry: {e}")
                 break
@@ -217,6 +248,7 @@ def live_split():
     stream.start_stream()
 
     entries = load_log()
+    _write_local_status(mic_state="listening", mic_state_ts=time.time(), conv_state="idle")
     print(f"Publishing to {LOG_FILE} ({len(entries)} entries in local mirror)")
     print(f"Listening... a {PAUSE_MS}ms pause ends a chunk. Ctrl+C to stop.")
     print("Type 'm' + Enter at any time to mute/unmute.\n")
@@ -244,9 +276,11 @@ def live_split():
                 if muted.is_set():
                     muted.clear()
                     print("[mic] UNMUTED")
+                    _write_local_status(mic_state="listening", mic_state_ts=time.time())
                 else:
                     muted.set()
                     print("[mic] MUTED — not listening")
+                    _write_local_status(mic_state="muted", mic_state_ts=time.time())
 
     control_thread = threading.Thread(target=mute_control_loop, daemon=True)
     control_thread.start()
@@ -276,9 +310,17 @@ def live_split():
             rec.AcceptWaveform(frame)  # feed regardless, keeps partials live
 
             if is_speech:
+                was_in_speech = in_speech
                 in_speech = True
                 silence_run = 0
                 speech_run += 1
+
+                if not was_in_speech:
+                    # Onset of speech -- the one moment run_all.py's playback
+                    # watcher actually needs to know about, so it can cut
+                    # Jarvis off immediately (barge-in). Written once per
+                    # utterance, not per-frame.
+                    _write_local_status(mic_state="speech", mic_state_ts=time.time())
 
                 if SHOW_PARTIAL_PREVIEW:
                     partial = json.loads(rec.PartialResult()).get("partial", "")
@@ -305,6 +347,7 @@ def live_split():
                 silence_run = 0
                 speech_run = 0
                 last_partial = ""
+                _write_local_status(mic_state="listening", mic_state_ts=time.time())
 
                 if raw_text:
                     now = time.perf_counter()
