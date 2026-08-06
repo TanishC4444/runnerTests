@@ -47,9 +47,16 @@ import os
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
+
+try:
+    import fcntl
+except ImportError:  # Windows fallback; fcntl is available on macOS/Linux.
+    fcntl = None
 
 import pyaudio
 import webrtcvad
@@ -70,6 +77,20 @@ LOG_DIR = os.path.join("chat", "Log 1")
 LOG_FILE = os.path.join(LOG_DIR, "chunks.json")
 
 PUSH_RETRIES = 3
+GIT_LOCK_FILE = os.path.join(tempfile.gettempdir(), "runnerTests_git_sync.lock")
+
+
+@contextmanager
+def git_sync_lock():
+    """Serialize Git operations with run_all.py across both processes."""
+    with open(GIT_LOCK_FILE, "a+") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def fmt(seconds: float) -> str:
@@ -104,10 +125,13 @@ def git_pull_log():
     response data to this same file independently, so this is what keeps
     us from writing on top of a stale local copy."""
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["git", "pull", "--rebase", "--autostash"],
-            check=True, capture_output=True, timeout=20,
+            capture_output=True, text=True, timeout=20,
         )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            print(f"[git] pull failed (continuing with local copy): {detail}")
     except Exception as e:
         print(f"[git] pull failed (continuing with local copy): {e}")
 
@@ -163,18 +187,22 @@ def worker_loop(work_q: "queue.Queue", tool, t_start: float):
         # Sync first, then reload from disk -- never trust an in-memory
         # copy here, since the cloud watcher may have added response
         # fields to earlier entries since we last looked.
-        git_pull_log()
-        entries = load_log()
+        # Keep pull -> reload -> write -> commit -> push atomic relative to
+        # run_all.py's background pulls. Concurrent Git commands previously
+        # left an interrupted rebase that blocked every later sync.
+        with git_sync_lock():
+            git_pull_log()
+            entries = load_log()
 
-        entry = {
-            "datetime": datetime.now().isoformat(timespec="seconds"),
-            "talk_seconds": round(talk_seconds, 2),
-            "text": fixed,
-            "raw_text": raw_text,
-        }
-        entries.append(entry)
-        save_log(entries)
-        git_push_log()
+            entry = {
+                "datetime": datetime.now().isoformat(timespec="seconds"),
+                "talk_seconds": round(talk_seconds, 2),
+                "text": fixed,
+                "raw_text": raw_text,
+            }
+            entries.append(entry)
+            save_log(entries)
+            git_push_log()
 
 
 def live_split():

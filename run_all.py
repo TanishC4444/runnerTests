@@ -26,6 +26,12 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
+
+try:
+    import fcntl
+except ImportError:  # Windows fallback; fcntl is available on macOS/Linux.
+    fcntl = None
 
 import requests
 
@@ -46,6 +52,20 @@ CHUNKS_LOG_FILE = os.path.join("chat", "Log 1", "chunks.json")
 LISTENER_SCRIPT = "live_split_on_pauses.py"
 READY_TIMEOUT_S = 240  # generous: cold model pull + Ollama boot can be slow
 RESPONSE_POLL_SECONDS = 3
+GIT_LOCK_FILE = os.path.join(tempfile.gettempdir(), "runnerTests_git_sync.lock")
+
+
+@contextmanager
+def git_sync_lock():
+    """Serialize Git operations with the microphone subprocess."""
+    with open(GIT_LOCK_FILE, "a+") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def trigger_workflow():
@@ -168,10 +188,11 @@ def git_pull_quiet():
     """Best-effort pull -- if it fails (e.g. a lock held by the listener's
     own concurrent pull), just skip this cycle and try again shortly."""
     try:
-        subprocess.run(
-            ["git", "pull", "--rebase", "--autostash"],
-            capture_output=True, timeout=20,
-        )
+        with git_sync_lock():
+            subprocess.run(
+                ["git", "pull", "--rebase", "--autostash"],
+                capture_output=True, timeout=20,
+            )
     except Exception:
         pass
 
