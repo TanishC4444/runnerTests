@@ -182,5 +182,11 @@
     "talk_seconds": 3.03,
     "text": "Hello can you respond back to me",
     "raw_text": "hello can you respond back to me"
+  },
+  {
+    "datetime": "2026-08-05T19:46:46",
+    "talk_seconds": 3.27,
+    "text": "Hello are you there can you say something",
+    "raw_text": "hello are you there can you can you say something"
   }
 ]
