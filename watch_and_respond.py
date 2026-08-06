@@ -53,7 +53,7 @@ MODEL = "qwen2.5:3b"
 # otherwise, which is why replies felt clipped -- this gives real replies
 # room to actually finish a thought. The warm-up ping stays separately
 # capped (see announce_ready) so it doesn't slow down startup.
-REPLY_MAX_TOKENS = 160
+REPLY_MAX_TOKENS = 200
 GENERATE_TIMEOUT_S = 180  # CPU-only runner; keep live conversation responsive
 
 POLL_SECONDS = 3
