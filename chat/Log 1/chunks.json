@@ -122,5 +122,11 @@
     "talk_seconds": 2.25,
     "text": "Paul not poll",
     "raw_text": "paul not poll poll"
+  },
+  {
+    "datetime": "2026-08-05T19:35:22",
+    "talk_seconds": 0.45,
+    "text": "oh",
+    "raw_text": "oh"
   }
 ]
