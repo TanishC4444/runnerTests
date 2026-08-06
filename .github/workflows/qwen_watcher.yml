@@ -21,7 +21,9 @@ jobs:
           path: |
             /usr/local/bin/ollama
             /usr/local/lib/ollama
-          key: ollama-bin-linux-v1
+          # v2 intentionally invalidates the old cache involved in the
+          # generation-time HTTP 500 failure.
+          key: ollama-bin-linux-v2
         continue-on-error: true   # caching is a nice-to-have, never worth failing the session over
       - name: Install Ollama (skip download if cached)
         run: |
@@ -63,23 +65,22 @@ jobs:
           path: |
             /usr/local/bin/ollama
             /usr/local/lib/ollama
-          key: ollama-bin-linux-v1
+          key: ollama-bin-linux-v2
         continue-on-error: true
       - name: Restore Ollama model cache
         id: cache-ollama
         uses: actions/cache/restore@v4
         with:
           path: ~/.ollama/models
-          key: ollama-qwen2.5-3b-v1
+          # v2 forces one clean model download instead of trusting the old
+          # manifest/blob cache that produced a generation-time HTTP 500.
+          key: ollama-qwen2.5-3b-v2
         continue-on-error: true
-      - name: Pull Qwen 2.5 3B (skip if already cached)
+      - name: Verify/pull Qwen 2.5 3B
         run: |
-          if ollama list | grep -q "qwen2.5:3b"; then
-            echo "qwen2.5:3b already present from cache restore, skipping download."
-          else
-            echo "Not found in restored cache, pulling..."
-            ollama pull qwen2.5:3b
-          fi
+          # Pull even after a cache hit. Ollama reuses valid blobs but verifies
+          # the manifest and restores anything missing or damaged.
+          ollama pull qwen2.5:3b
       - name: Save Ollama model cache
         # Save it right here, immediately after the pull -- not deferred
         # to the job's post-cleanup phase. run_all.py cancels this
@@ -92,7 +93,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ~/.ollama/models
-          key: ollama-qwen2.5-3b-v1
+          key: ollama-qwen2.5-3b-v2
         continue-on-error: true
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -107,4 +108,16 @@ jobs:
           GH_TOKEN: ${{ secrets.RUNNER_PAT }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PYTHONUNBUFFERED: "1"   # step logs are not a TTY -- without this, prints can sit buffered and invisible
-        run: python -u watch_and_respond.py
+        run: |
+          set -o pipefail
+          dump_ollama_log() {
+            code=$?
+            if [ "$code" -ne 0 ]; then
+              echo "::group::Ollama server log"
+              cat ollama.log || true
+              echo "::endgroup::"
+            fi
+            exit "$code"
+          }
+          trap dump_ollama_log EXIT
+          python -u watch_and_respond.py

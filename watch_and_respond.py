@@ -102,8 +102,19 @@ def ask_qwen(text: str, max_tokens: int | None = None) -> str:
         # a CPU-only runner; real replies pass REPLY_MAX_TOKENS instead
         payload["options"] = {"num_predict": max_tokens}
     resp = requests.post(OLLAMA_URL, json=payload, timeout=GENERATE_TIMEOUT_S)
-    resp.raise_for_status()
-    return resp.json().get("response", "").strip()
+    if not resp.ok:
+        # requests' default HTTPError only includes the status line. Ollama
+        # puts the useful cause (OOM, corrupt model blob, runner crash, etc.)
+        # in the response body, so preserve it in the Actions log.
+        detail = resp.text.strip() or "<empty response body>"
+        raise RuntimeError(
+            f"Ollama generation failed with HTTP {resp.status_code}: {detail[:4000]}"
+        )
+
+    reply = resp.json().get("response", "").strip()
+    if not reply:
+        raise RuntimeError("Ollama returned HTTP 200 but an empty response")
+    return reply
 
 
 def tts_base64(text: str, lang: str = "en") -> str:
@@ -147,14 +158,36 @@ def announce_ready():
     just slow. A capped call still proves the model is loaded and
     generating, in a few seconds instead of a minute-plus."""
     print("[ready] sending a capped warm-up prompt to confirm Qwen is loaded...", flush=True)
+    t0 = time.time()
     try:
-        t0 = time.time()
         ask_qwen("Say 'ready'.", max_tokens=5)
-        print(f"[ready] warm-up call answered in {time.time() - t0:.1f}s", flush=True)
+    except Exception as e:
+        error = f"Qwen warm-up failed: {e}"
+        print(f"[ready] {error}", flush=True)
+        try:
+            push_status(
+                {
+                    "ready": False,
+                    "error": error,
+                    "failed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                },
+                "Qwen watcher failed to start",
+            )
+        except Exception as status_error:
+            print(f"[ready] failed to publish startup error: {status_error}", flush=True)
+        # A broken model cannot answer real chunks either. Fail the job
+        # instead of advertising a ready watcher that silently does nothing.
+        raise
+
+    print(f"[ready] warm-up call answered in {time.time() - t0:.1f}s", flush=True)
+
+    try:
         audio_b64 = tts_base64("I'm ready, go ahead.", lang="en")
         print("[ready] TTS generated.", flush=True)
     except Exception as e:
-        print(f"[ready] warm-up call failed, pushing text-only ready signal: {e}", flush=True)
+        # Speech is optional; a TTS outage should not disguise a healthy
+        # local model as a failed model startup.
+        print(f"[ready] TTS failed, using text-only ready signal: {e}", flush=True)
         audio_b64 = None
 
     try:

@@ -119,8 +119,8 @@ def play_audio(path: str):
 
 def wait_for_ready(timeout_s: int = READY_TIMEOUT_S):
     """Poll status.json until the cloud watcher announces it's ready,
-    then play its verbal cue. Returns either way once done or timed out
-    (a timeout just means you'll start listening a bit early).
+    then play its verbal cue. Raises if startup fails or times out so the
+    microphone never records against a watcher that cannot answer.
 
     Prints an elapsed-time heartbeat every 15s -- the wait can legitimately
     take a couple minutes (Ollama install + model load on a CPU-only
@@ -131,6 +131,8 @@ def wait_for_ready(timeout_s: int = READY_TIMEOUT_S):
     last_heartbeat = start
     while time.time() < deadline:
         payload, _ = fetch_status()
+        if payload and payload.get("error"):
+            raise RuntimeError(payload["error"])
         if payload and payload.get("ready"):
             audio_b64 = payload.get("ready_audio_b64")
             if audio_b64:
@@ -147,7 +149,9 @@ def wait_for_ready(timeout_s: int = READY_TIMEOUT_S):
                   f"Check the 'Run watcher loop' step's live log if this runs long.")
             last_heartbeat = now
         time.sleep(2)
-    print("[cloud] timed out waiting for the ready signal, starting listener anyway.")
+    raise RuntimeError(
+        "Timed out waiting for Qwen to pass its model warm-up; the microphone was not started."
+    )
 
 
 def load_chunks():
@@ -218,7 +222,12 @@ def main():
         sys.exit("[cloud] could not find the triggered run.")
     print(f"[cloud] run id {run_id} is live.")
 
-    wait_for_ready()
+    try:
+        wait_for_ready()
+    except RuntimeError as e:
+        print(f"[cloud] startup failed: {e}")
+        cancel_run(run_id)
+        return
 
     print("[local] starting mic listener...")
     listener = subprocess.Popen([sys.executable, LISTENER_SCRIPT])
