@@ -152,5 +152,11 @@
     "talk_seconds": 0.51,
     "text": "Paul",
     "raw_text": "paul"
+  },
+  {
+    "datetime": "2026-08-05T19:40:30",
+    "talk_seconds": 1.44,
+    "text": "Please tell me that you're there",
+    "raw_text": "please tell me that you're there"
   }
 ]
