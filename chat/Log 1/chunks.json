@@ -92,5 +92,11 @@
     "talk_seconds": 1.32,
     "text": "How are you doing",
     "raw_text": "how are you doing"
+  },
+  {
+    "datetime": "2026-08-05T19:25:10",
+    "talk_seconds": 3.81,
+    "text": "Can you give me a response like what's the capital of France",
+    "raw_text": "can you give me a response like what's the capital of france"
   }
 ]
