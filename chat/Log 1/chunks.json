@@ -134,5 +134,11 @@
     "talk_seconds": 0.9,
     "text": "poll",
     "raw_text": "poll"
+  },
+  {
+    "datetime": "2026-08-05T19:35:30",
+    "talk_seconds": 1.38,
+    "text": "I'm pulling a door",
+    "raw_text": "i'm pulling a door"
   }
 ]
