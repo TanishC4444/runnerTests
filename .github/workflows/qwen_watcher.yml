@@ -27,7 +27,8 @@ jobs:
         run: |
           # guarantee this exists even on Ollama versions that don't create
           # it, so the save step below never fails with "path does not exist"
-          mkdir -p /usr/local/lib/ollama
+          # -- needs sudo, /usr/local/lib isn't writable by the runner user
+          sudo mkdir -p /usr/local/lib/ollama
 
           if [ -x /usr/local/bin/ollama ]; then
             echo "Ollama binary restored from cache, skipping install script."
