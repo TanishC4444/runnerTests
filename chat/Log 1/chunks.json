@@ -26,5 +26,11 @@
     "talk_seconds": 0.9,
     "text": "What's your name",
     "raw_text": "what's your name"
+  },
+  {
+    "datetime": "2026-08-05T20:04:38.234393",
+    "talk_seconds": 10.56,
+    "text": "Hello it seems like you just wanted to say hello how can I assist you today feel free to ask any questions or later I know if there's anything specific you'd like to discuss",
+    "raw_text": "hello it seems like you just wanted to say hello how can i assist you today feel free to ask any questions or later i know if there's anything specific you'd like to discuss"
   }
 ]
