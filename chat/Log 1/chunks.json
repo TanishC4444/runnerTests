@@ -188,5 +188,11 @@
     "talk_seconds": 3.27,
     "text": "Hello are you there can you say something",
     "raw_text": "hello are you there can you can you say something"
+  },
+  {
+    "datetime": "2026-08-05T19:55:22",
+    "talk_seconds": 1.68,
+    "text": "Are you there",
+    "raw_text": "are you there"
   }
 ]
