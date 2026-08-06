@@ -1,7 +1,7 @@
 """
-Runs on the Actions runner itself. Polls the repo's chunks.json every
-second via the GitHub Contents API (using the file SHA to detect changes),
-and for every new entry created during the current session:
+Runs on the Actions runner itself. Fetches the remote branch and reads
+chunks.json directly from that fetched Git commit (using the file's blob SHA
+to detect changes), and for every new entry created during the current session:
   1. waits until 5s pass with no further change (so it doesn't respond
      mid-thought if you're still talking / more chunks are still landing)
   2. sends the text to the locally-running Qwen 2.5 3B (via Ollama)
@@ -56,12 +56,13 @@ MODEL = "qwen2.5:3b"
 REPLY_MAX_TOKENS = 160
 GENERATE_TIMEOUT_S = 180  # CPU-only runner; keep live conversation responsive
 
-POLL_SECONDS = 2
+POLL_SECONDS = 3
 QUIET_SECONDS = 2  # listener already emits only completed pause-delimited chunks
 GITHUB_TIMEOUT_S = 30
 PUSH_RETRIES = 5
 HEARTBEAT_SECONDS = 15
 BRANCH = os.environ.get("GITHUB_REF_NAME", "main")
+REMOTE_REF = f"refs/remotes/origin/{BRANCH}"
 
 
 def gh_headers(etag=None):
@@ -79,22 +80,53 @@ def gh_headers(etag=None):
 
 
 def fetch_file():
-    """Return the current entries and GitHub blob SHA.
+    """Fetch the moving remote branch and return entries plus blob SHA.
 
-    The SHA is used as the change token instead of relying on conditional
-    ETag responses, which have proven unreliable in this long polling loop.
+    This deliberately avoids the Contents API for polling. actions/checkout
+    leaves authenticated Git credentials on the runner, and passing the
+    `branch:path` expression as one subprocess argument handles spaces in the
+    path without any shell quoting ambiguity.
     """
-    resp = requests.get(
-        API_URL,
-        headers=gh_headers(),
-        params={"ref": BRANCH},
+    fetch = subprocess.run(
+        [
+            "git",
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "origin",
+            f"+refs/heads/{BRANCH}:{REMOTE_REF}",
+        ],
+        capture_output=True,
+        text=True,
         timeout=GITHUB_TIMEOUT_S,
     )
-    resp.raise_for_status()
-    data = resp.json()
-    content = base64.b64decode(data["content"]).decode("utf-8")
-    entries = json.loads(content) if content.strip() else []
-    return entries, data["sha"]
+    if fetch.returncode != 0:
+        detail = (fetch.stderr or fetch.stdout).strip()
+        raise RuntimeError(f"git fetch origin/{BRANCH} failed: {detail}")
+
+    object_name = f"{REMOTE_REF}:{FILE_PATH}"
+    show = subprocess.run(
+        ["git", "show", object_name],
+        capture_output=True,
+        text=True,
+        timeout=GITHUB_TIMEOUT_S,
+    )
+    if show.returncode != 0:
+        detail = (show.stderr or show.stdout).strip()
+        raise RuntimeError(f"could not read {object_name}: {detail}")
+
+    blob = subprocess.run(
+        ["git", "rev-parse", object_name],
+        capture_output=True,
+        text=True,
+        timeout=GITHUB_TIMEOUT_S,
+    )
+    if blob.returncode != 0:
+        detail = (blob.stderr or blob.stdout).strip()
+        raise RuntimeError(f"could not resolve {object_name}: {detail}")
+
+    entries = json.loads(show.stdout) if show.stdout.strip() else []
+    return entries, blob.stdout.strip()
 
 
 def push_file(entries, sha, message):
@@ -305,7 +337,7 @@ def main():
         try:
             entries, sha = fetch_file()
         except Exception as e:
-            print(f"[poll] GitHub read failed; retrying: {e}", flush=True)
+            print(f"[poll] remote Git read failed; retrying: {e}", flush=True)
             time.sleep(POLL_SECONDS)
             continue
 
