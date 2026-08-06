@@ -62,5 +62,11 @@
     "talk_seconds": 6.69,
     "text": "Hello can you write anything back to me",
     "raw_text": "hello can you write anything back to me"
+  },
+  {
+    "datetime": "2026-08-05T19:05:07",
+    "talk_seconds": 0.78,
+    "text": "hurry",
+    "raw_text": "hurry"
   }
 ]
