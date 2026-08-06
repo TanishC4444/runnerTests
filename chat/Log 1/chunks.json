@@ -128,5 +128,11 @@
     "talk_seconds": 0.45,
     "text": "oh",
     "raw_text": "oh"
+  },
+  {
+    "datetime": "2026-08-05T19:35:25",
+    "talk_seconds": 0.9,
+    "text": "poll",
+    "raw_text": "poll"
   }
 ]
