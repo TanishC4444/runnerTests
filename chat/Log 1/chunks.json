@@ -116,5 +116,11 @@
     "talk_seconds": 1.86,
     "text": "Then my get poll fail",
     "raw_text": "then my get poll fail"
+  },
+  {
+    "datetime": "2026-08-05T19:35:17",
+    "talk_seconds": 2.25,
+    "text": "Paul not poll",
+    "raw_text": "paul not poll poll"
   }
 ]
