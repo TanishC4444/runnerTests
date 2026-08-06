@@ -53,19 +53,25 @@ MODEL = "qwen2.5:3b"
 # otherwise, which is why replies felt clipped -- this gives real replies
 # room to actually finish a thought. The warm-up ping stays separately
 # capped (see announce_ready) so it doesn't slow down startup.
-REPLY_MAX_TOKENS = 500
-GENERATE_TIMEOUT_S = 240  # CPU-only runner + longer replies can take a while
+REPLY_MAX_TOKENS = 160
+GENERATE_TIMEOUT_S = 180  # CPU-only runner; keep live conversation responsive
 
-POLL_SECONDS = 1
-QUIET_SECONDS = 5  # required pause before we respond
+POLL_SECONDS = 2
+QUIET_SECONDS = 2  # listener already emits only completed pause-delimited chunks
 GITHUB_TIMEOUT_S = 30
 PUSH_RETRIES = 5
+HEARTBEAT_SECONDS = 15
+BRANCH = os.environ.get("GITHUB_REF_NAME", "main")
 
 
 def gh_headers(etag=None):
     h = {
         "Authorization": f"Bearer {TOKEN}",
         "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        # The watcher needs the moving branch head, not a cached representation
+        # from when this Actions job started.
+        "Cache-Control": "no-cache",
     }
     if etag:
         h["If-None-Match"] = etag
@@ -78,7 +84,12 @@ def fetch_file():
     The SHA is used as the change token instead of relying on conditional
     ETag responses, which have proven unreliable in this long polling loop.
     """
-    resp = requests.get(API_URL, headers=gh_headers(), timeout=GITHUB_TIMEOUT_S)
+    resp = requests.get(
+        API_URL,
+        headers=gh_headers(),
+        params={"ref": BRANCH},
+        timeout=GITHUB_TIMEOUT_S,
+    )
     resp.raise_for_status()
     data = resp.json()
     content = base64.b64decode(data["content"]).decode("utf-8")
@@ -93,7 +104,12 @@ def push_file(entries, sha, message):
     resp = requests.put(
         API_URL,
         headers=gh_headers(),
-        json={"message": message, "content": content_b64, "sha": sha},
+        json={
+            "message": message,
+            "content": content_b64,
+            "sha": sha,
+            "branch": BRANCH,
+        },
         timeout=GITHUB_TIMEOUT_S,
     )
     resp.raise_for_status()
@@ -175,7 +191,12 @@ def tts_base64(text: str, lang: str = "en") -> str:
 def fetch_status():
     """Returns (payload_dict, sha). payload/sha are (None, None) if the
     file doesn't exist yet (first run in this repo)."""
-    resp = requests.get(STATUS_API_URL, headers=gh_headers())
+    resp = requests.get(
+        STATUS_API_URL,
+        headers=gh_headers(),
+        params={"ref": BRANCH},
+        timeout=GITHUB_TIMEOUT_S,
+    )
     if resp.status_code == 404:
         return None, None
     resp.raise_for_status()
@@ -190,10 +211,16 @@ def push_status(payload: dict, message: str):
     body = {
         "message": message,
         "content": base64.b64encode(json.dumps(payload, indent=2).encode("utf-8")).decode("utf-8"),
+        "branch": BRANCH,
     }
     if sha:
         body["sha"] = sha
-    resp = requests.put(STATUS_API_URL, headers=gh_headers(), json=body)
+    resp = requests.put(
+        STATUS_API_URL,
+        headers=gh_headers(),
+        json=body,
+        timeout=GITHUB_TIMEOUT_S,
+    )
     resp.raise_for_status()
 
 
@@ -262,21 +289,55 @@ def main():
     # user hears the ready cue instead of draining an old backlog first.
     initial_entries, last_sha = fetch_file()
     handled = {entry_key(entry) for entry in initial_entries}
-    print(f"[startup] ignoring {len(handled)} pre-existing chunks", flush=True)
+    print(
+        f"[startup] branch={BRANCH} chunks_sha={last_sha[:10]} "
+        f"ignoring {len(handled)} pre-existing chunks",
+        flush=True,
+    )
 
     announce_ready()
 
     last_change_time = None
     pending_entries = None
+    last_heartbeat = time.time()
 
     while True:
-        entries, sha = fetch_file()
+        try:
+            entries, sha = fetch_file()
+        except Exception as e:
+            print(f"[poll] GitHub read failed; retrying: {e}", flush=True)
+            time.sleep(POLL_SECONDS)
+            continue
 
         if sha != last_sha:
             # file changed since last check
+            new_count = sum(
+                entry_key(entry) not in handled and "response" not in entry
+                for entry in entries
+            )
+            print(
+                f"[poll] chunks changed {last_sha[:10]} -> {sha[:10]}; "
+                f"{new_count} new chunk(s)",
+                flush=True,
+            )
             pending_entries = entries
             last_sha = sha
             last_change_time = time.time()
+
+        now = time.time()
+        if now - last_heartbeat >= HEARTBEAT_SECONDS:
+            pending_count = 0
+            if pending_entries is not None:
+                pending_count = sum(
+                    entry_key(entry) not in handled and "response" not in entry
+                    for entry in pending_entries
+                )
+            print(
+                f"[poll] alive branch={BRANCH} chunks_sha={last_sha[:10]} "
+                f"pending={pending_count}",
+                flush=True,
+            )
+            last_heartbeat = now
 
         # once quiet, process anything unprocessed
         if (
