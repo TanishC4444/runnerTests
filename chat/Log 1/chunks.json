@@ -98,5 +98,11 @@
     "talk_seconds": 3.81,
     "text": "Can you give me a response like what's the capital of France",
     "raw_text": "can you give me a response like what's the capital of france"
+  },
+  {
+    "datetime": "2026-08-05T19:25:19",
+    "talk_seconds": 1.53,
+    "text": "Are you actually their hello",
+    "raw_text": "are you actually their hello"
   }
 ]
