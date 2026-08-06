@@ -74,5 +74,11 @@
     "talk_seconds": 0.93,
     "text": "How are you",
     "raw_text": "how are you"
+  },
+  {
+    "datetime": "2026-08-05T19:05:26",
+    "talk_seconds": 0.93,
+    "text": "Is everything okay",
+    "raw_text": "is everything okay"
   }
 ]
