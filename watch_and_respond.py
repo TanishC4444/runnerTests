@@ -1,7 +1,7 @@
 """
 Runs on the Actions runner itself. Polls the repo's chunks.json every
-second via the GitHub Contents API (using ETags so unchanged polls don't
-cost API-rate-limit budget), and for every new entry:
+second via the GitHub Contents API (using the file SHA to detect changes),
+and for every new entry created during the current session:
   1. waits until 5s pass with no further change (so it doesn't respond
      mid-thought if you're still talking / more chunks are still landing)
   2. sends the text to the locally-running Qwen 2.5 3B (via Ollama)
@@ -58,6 +58,8 @@ GENERATE_TIMEOUT_S = 240  # CPU-only runner + longer replies can take a while
 
 POLL_SECONDS = 1
 QUIET_SECONDS = 5  # required pause before we respond
+GITHUB_TIMEOUT_S = 30
+PUSH_RETRIES = 5
 
 
 def gh_headers(etag=None):
@@ -70,16 +72,18 @@ def gh_headers(etag=None):
     return h
 
 
-def fetch_file(etag=None):
-    """Returns (entries, sha, etag) or (None, None, etag) if unchanged (304)."""
-    resp = requests.get(API_URL, headers=gh_headers(etag))
-    if resp.status_code == 304:
-        return None, None, etag
+def fetch_file():
+    """Return the current entries and GitHub blob SHA.
+
+    The SHA is used as the change token instead of relying on conditional
+    ETag responses, which have proven unreliable in this long polling loop.
+    """
+    resp = requests.get(API_URL, headers=gh_headers(), timeout=GITHUB_TIMEOUT_S)
     resp.raise_for_status()
     data = resp.json()
     content = base64.b64decode(data["content"]).decode("utf-8")
     entries = json.loads(content) if content.strip() else []
-    return entries, data["sha"], resp.headers.get("ETag")
+    return entries, data["sha"]
 
 
 def push_file(entries, sha, message):
@@ -90,9 +94,53 @@ def push_file(entries, sha, message):
         API_URL,
         headers=gh_headers(),
         json={"message": message, "content": content_b64, "sha": sha},
+        timeout=GITHUB_TIMEOUT_S,
     )
     resp.raise_for_status()
     return resp.json()["content"]["sha"]
+
+
+def entry_key(entry: dict) -> tuple:
+    """Stable-enough identity for chunks created by the local listener."""
+    return (
+        entry.get("datetime"),
+        entry.get("raw_text"),
+        entry.get("talk_seconds"),
+    )
+
+
+def push_response(key: tuple, reply: str, audio_b64: str | None):
+    """Merge one response into the newest file and push it immediately.
+
+    The microphone can add another chunk while Qwen is generating. Re-fetching
+    here prevents that concurrent commit from being overwritten; retrying a
+    conflict covers a chunk that lands between our fetch and PUT.
+    """
+    for attempt in range(1, PUSH_RETRIES + 1):
+        entries, sha = fetch_file()
+        target = next((entry for entry in entries if entry_key(entry) == key), None)
+        if target is None:
+            raise RuntimeError("chunk disappeared before its response could be saved")
+        if "response" in target:
+            return
+
+        target["response"] = reply
+        if audio_b64:
+            target["response_audio_b64"] = audio_b64
+
+        try:
+            push_file(entries, sha, "Add Qwen response + TTS audio")
+            return
+        except requests.HTTPError as e:
+            if e.response is None or e.response.status_code not in (409, 422):
+                raise
+            print(
+                f"  chunk file changed during response push; retrying "
+                f"({attempt}/{PUSH_RETRIES})",
+                flush=True,
+            )
+
+    raise RuntimeError("could not save response after repeated chunk-file conflicts")
 
 
 def ask_qwen(text: str, max_tokens: int | None = None) -> str:
@@ -208,24 +256,27 @@ def announce_ready():
 
 def main():
     print(f"Watching {FILE_PATH} in {REPO}, polling every {POLL_SECONDS}s...")
+
+    # Anything already present belongs to an earlier session. Mark it before
+    # announcing readiness so this run answers only chunks recorded after the
+    # user hears the ready cue instead of draining an old backlog first.
+    initial_entries, last_sha = fetch_file()
+    handled = {entry_key(entry) for entry in initial_entries}
+    print(f"[startup] ignoring {len(handled)} pre-existing chunks", flush=True)
+
     announce_ready()
 
-    etag = None
-    last_seen_count = None
     last_change_time = None
     pending_entries = None
-    pending_sha = None
 
     while True:
-        entries, sha, etag = fetch_file(etag)
+        entries, sha = fetch_file()
 
-        if entries is not None:
+        if sha != last_sha:
             # file changed since last check
             pending_entries = entries
-            pending_sha = sha
+            last_sha = sha
             last_change_time = time.time()
-            if last_seen_count is None:
-                last_seen_count = len(entries)
 
         # once quiet, process anything unprocessed
         if (
@@ -233,12 +284,13 @@ def main():
             and last_change_time is not None
             and time.time() - last_change_time >= QUIET_SECONDS
         ):
-            changed = False
             for entry in pending_entries:
-                if "response" in entry:
+                key = entry_key(entry)
+                if key in handled or "response" in entry:
                     continue
                 text = entry.get("text", "").strip()
                 if not text:
+                    handled.add(key)
                     continue
 
                 print(f"Responding to: {text[:60]!r}", flush=True)
@@ -246,24 +298,41 @@ def main():
                     t0 = time.time()
                     reply = ask_qwen(text, max_tokens=REPLY_MAX_TOKENS)
                     print(f"  generated in {time.time() - t0:.1f}s: {reply[:60]!r}", flush=True)
-                    audio_b64 = tts_base64(reply, lang="en")
                 except Exception as e:
-                    print(f"Failed on entry: {e}", flush=True)
+                    print(f"  generation failed: {e}", flush=True)
+                    handled.add(key)
                     continue
 
-                entry["response"] = reply
-                entry["response_audio_b64"] = audio_b64
-                changed = True
+                try:
+                    audio_b64 = tts_base64(reply, lang="en")
+                except Exception as e:
+                    print(f"  TTS failed; saving text response only: {e}", flush=True)
+                    audio_b64 = None
 
-            if changed:
-                pending_sha = push_file(
-                    pending_entries, pending_sha, "Add Qwen response + TTS audio"
-                )
-                # re-fetch etag/sha baseline after our own push
-                entries, sha, etag = fetch_file(None)
+                try:
+                    push_response(key, reply, audio_b64)
+                    print("  response pushed", flush=True)
+                except Exception as e:
+                    print(f"  failed to save response: {e}", flush=True)
+                finally:
+                    handled.add(key)
 
-            pending_entries = None
-            last_change_time = None
+            # Refresh after the batch. A new chunk may have landed while Qwen
+            # was generating; keep it pending instead of accidentally treating
+            # its SHA as already handled.
+            latest_entries, last_sha = fetch_file()
+            still_pending = any(
+                entry_key(entry) not in handled
+                and "response" not in entry
+                and entry.get("text", "").strip()
+                for entry in latest_entries
+            )
+            if still_pending:
+                pending_entries = latest_entries
+                last_change_time = time.time()
+            else:
+                pending_entries = None
+                last_change_time = None
 
         time.sleep(POLL_SECONDS)
 
