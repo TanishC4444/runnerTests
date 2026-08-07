@@ -130,5 +130,13 @@
     "raw_text": "oh tell me about tell me about good it's in quantum computer",
     "session_id": "1786125856239933000",
     "response": "I believe you are asking about qubits, which are the fundamental building blocks of quantum computers. A qubit, short for quantum bit, is the quantum equivalent of the classical bit used in traditional computers. While a classical bit can only be in one of two states, either zero or one, a qubit can exist in a state of superposition. This means it can represent both zero and one simultaneously. This unique property allows quantum computers to perform many calculations at once, potentially solving certain complex problems much faster than classical computers. Qubits can be made from various physical systems, such as trapped ions, superconducting circuits, or photons."
+  },
+  {
+    "datetime": "2026-08-07T13:06:26.930910",
+    "talk_seconds": 2.67,
+    "text": "The return of recent war that you were formed of",
+    "raw_text": "the return of recent war that you were formed of",
+    "session_id": "1786125856239933000",
+    "response": "I think there might be some confusion about my origins. I am not formed from war, nor do I have a physical body or a history involving conflict. I am a large language model, trained by Google. My creation was the result of extensive research and development in the field of artificial intelligence and machine learning. I am here to assist you with information, answer questions, and help with various tasks in a helpful and harmless way."
   }
 ]
