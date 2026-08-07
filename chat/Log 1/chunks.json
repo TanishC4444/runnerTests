@@ -186,5 +186,13 @@
     "raw_text": "hey what air model and my using right now",
     "session_id": "1786146955591150000",
     "response": "You are currently using Qwen (Tongyi Qianwen), developed by Alibaba Group's Tongyi Lab."
+  },
+  {
+    "datetime": "2026-08-07T18:56:55.829568",
+    "talk_seconds": 0.72,
+    "text": "You are currently",
+    "raw_text": "you are currently",
+    "session_id": "1786146955591150000",
+    "response": "I am Qwen, a large language model independently developed by Alibaba Group's Tongyi Lab. How can I help you today?"
   }
 ]
