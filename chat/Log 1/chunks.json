@@ -90,5 +90,13 @@
     "raw_text": "hello how are you",
     "session_id": "1786125503269574000",
     "response": "Hello! I am doing well, thank you for asking. How are you doing today?"
+  },
+  {
+    "datetime": "2026-08-07T13:04:27.425440",
+    "talk_seconds": 1.68,
+    "text": "Which an I am I talking to I know",
+    "raw_text": "which a i am i talking to i know",
+    "session_id": "1786125856239933000",
+    "response": "You are talking to me, your AI voice assistant. How can I help you today?"
   }
 ]
