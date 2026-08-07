@@ -71,6 +71,7 @@ SESSION_ID = os.environ.get("RUNNER_SESSION_ID")
 # IPC between the two processes on your machine, written to on VAD state
 # *transitions* only (not every audio frame) so it stays cheap.
 LOCAL_STATUS_FILE = os.path.join(tempfile.gettempdir(), "jarvis_local_status.json")
+LOCAL_RESPONSE_FILE = os.path.join(tempfile.gettempdir(), "jarvis_local_responses.jsonl")
 
 
 def _write_local_status(**fields):
@@ -90,6 +91,25 @@ def _write_local_status(**fields):
         # The dashboard/barge-in is a nice-to-have; never let it take down
         # the actual mic pipeline.
         pass
+
+
+def _queue_local_response(response_id: str, text: str):
+    """Hand a primary response directly to run_all.py for immediate speech.
+
+    The remote chunks log remains the durable record, but local playback must
+    not depend on a successful Git pull. Only this listener writes the queue,
+    and run_all.py de-duplicates entries by response_id.
+    """
+    event = {"response_id": response_id, "text": text}
+    try:
+        with open(LOCAL_RESPONSE_FILE, "a", encoding="utf-8") as response_file:
+            response_file.write(json.dumps(event) + "\n")
+            response_file.flush()
+    except OSError as e:
+        # The durable remote response still exists and can be played after
+        # synchronization, so a local IPC problem is not a model failure and
+        # must not unnecessarily launch the backup model.
+        print(f"  [talkback] could not queue immediate local speech: {e}")
 
 MODEL_PATH = "model"
 SAMPLE_RATE = 16000
@@ -237,9 +257,8 @@ def worker_loop(work_q: "queue.Queue", tool, t_start: float):
             reply = groq_responder.ask_groq(fixed)
             entry["response"] = reply
             print(f"  [groq] {reply[:80]!r}")
-            _write_local_status(
-                conv_state="speaking", conv_state_ts=time.time(), last_reply_text=reply
-            )
+            _queue_local_response(entry["datetime"], reply)
+            _write_local_status(last_reply_text=reply)
         except groq_responder.GroqRateLimited:
             print("  [groq] rate limited -- falling back to Qwen for this chunk")
             fallback_reason = "rate limited"

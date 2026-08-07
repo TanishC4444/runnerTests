@@ -158,12 +158,14 @@ CHUNKS_LOG_FILE = os.path.join("chat", "Log 1", "chunks.json")
 LISTENER_SCRIPT = "live_split_on_pauses.py"
 READY_TIMEOUT_S = 240  # generous: cold model pull + Ollama boot can be slow
 RESPONSE_POLL_SECONDS = 1.5  # git pull, not an API call -- safe to poll tighter
+LOCAL_RESPONSE_POLL_SECONDS = 0.1
 GIT_LOCK_FILE = os.path.join(tempfile.gettempdir(), "runnerTests_git_sync.lock")
 
 # Same path live_split_on_pauses.py writes to. Local-only IPC, never touches
 # Git -- this is what makes barge-in and the dashboard possible without
 # changing anything about how the cloud side works.
 LOCAL_STATUS_FILE = os.path.join(tempfile.gettempdir(), "jarvis_local_status.json")
+LOCAL_RESPONSE_FILE = os.path.join(tempfile.gettempdir(), "jarvis_local_responses.jsonl")
 DASHBOARD_PORT = 8765
 # How aggressively the playback watcher checks "did the user start talking
 # yet". 80ms feels effectively instant without busy-looping the CPU.
@@ -432,6 +434,28 @@ def load_chunks():
     return []
 
 
+def load_local_responses() -> list[dict]:
+    """Read primary replies queued directly by the microphone process.
+
+    This local path makes Groq speech independent of Git synchronization.
+    The queue is session-scoped and response_watcher_loop de-duplicates it
+    against the durable chunks log using the chunk datetime/response ID.
+    """
+    try:
+        with open(LOCAL_RESPONSE_FILE, "r", encoding="utf-8") as response_file:
+            events = []
+            for line in response_file:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("response_id") and event.get("text"):
+                    events.append(event)
+            return events
+    except FileNotFoundError:
+        return []
+
+
 def git_pull_quiet():
     """Best-effort pull -- if it fails (e.g. a lock held by the listener's
     own concurrent pull), just skip this cycle and try again shortly."""
@@ -446,43 +470,66 @@ def git_pull_quiet():
 
 
 def response_watcher_loop(stop_event: threading.Event):
-    """Background thread: periodically checks chunks.json for replies
-    that have landed from the cloud watcher and plays them out loud --
-    this is what actually makes Qwen "talk back" instead of you having
-    to go open the file yourself. Runs independently of the listener's
-    own git activity, which only happens when you're the one speaking."""
+    """Speak primary local replies and backup replies from chunks.json.
+
+    Both paths use speak_locally_pipelined, whose player checks microphone
+    state every BARGE_IN_POLL_S, so either model can be interrupted. Primary
+    replies arrive through a local queue and do not wait for Git; the response
+    ID prevents the durable remote copy from being spoken a second time.
+    """
     # seed with anything already answered from a previous session so we
     # don't replay old responses on startup
     played = {e.get("datetime") for e in load_chunks() if "response" in e}
+    next_remote_poll = 0.0
 
     while not stop_event.is_set():
-        git_pull_quiet()
-        for entry in load_chunks():
-            key = entry.get("datetime")
-            if key in played or "response" not in entry:
+        # Primary Groq replies take the direct local path for minimum latency.
+        for event in load_local_responses():
+            key = event["response_id"]
+            if key in played:
                 continue
             played.add(key)
 
-            reply = entry.get("response", "")
-            print(f"[talkback] {reply[:60]!r}")
+            reply = event["text"]
+            print(f"[talkback:groq] {reply[:60]!r}")
             _write_local_status(
                 conv_state="speaking", conv_state_ts=time.time(), last_reply_text=reply
             )
-
-            speak_locally_pipelined(reply, session_start_ts=time.time())
-
+            speak_locally_pipelined(reply, session_start_ts=time.time(), tmp_prefix="groq_reply")
             _write_local_status(conv_state="idle", conv_state_ts=time.time())
 
-        stop_event.wait(RESPONSE_POLL_SECONDS)
+        # Backup responses still arrive through the durable remote log, but
+        # keep its slower Git polling separate from the 100ms local queue.
+        if time.monotonic() >= next_remote_poll:
+            git_pull_quiet()
+            for entry in load_chunks():
+                key = entry.get("datetime")
+                if key in played or "response" not in entry:
+                    continue
+                played.add(key)
+
+                reply = entry.get("response", "")
+                print(f"[talkback:qwen-backup] {reply[:60]!r}")
+                _write_local_status(
+                    conv_state="speaking", conv_state_ts=time.time(), last_reply_text=reply
+                )
+
+                speak_locally_pipelined(reply, session_start_ts=time.time())
+
+                _write_local_status(conv_state="idle", conv_state_ts=time.time())
+            next_remote_poll = time.monotonic() + RESPONSE_POLL_SECONDS
+
+        stop_event.wait(LOCAL_RESPONSE_POLL_SECONDS)
 
 
 def main():
     # Fresh session: clear any stale mic/conv state left from a previous run
     # before the dashboard starts reading it.
-    try:
-        os.remove(LOCAL_STATUS_FILE)
-    except FileNotFoundError:
-        pass
+    for session_file in (LOCAL_STATUS_FILE, LOCAL_RESPONSE_FILE):
+        try:
+            os.remove(session_file)
+        except FileNotFoundError:
+            pass
     start_dashboard_server()
 
     # Reset any stale "ready" flag from a previous session so that if the
