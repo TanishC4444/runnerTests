@@ -114,5 +114,13 @@
     "raw_text": "can you spot me what the seven wonders of the world or",
     "session_id": "1786125856239933000",
     "response": "The Seven Wonders of the Ancient World are the Great Pyramid of Giza, the Hanging Gardens of Babylon, the Statue of Zeus at Olympia, the Temple of Artemis at Ephesus, the Mausoleum at Halicarnassus, the Colossus of Rhodes, and the Lighthouse of Alexandria. Please note that only the Great Pyramid still exists today."
+  },
+  {
+    "datetime": "2026-08-07T13:05:44.032470",
+    "talk_seconds": 4.89,
+    "text": "oh, you wait no actually I want to know what cubits or in quantum computing",
+    "raw_text": "oh you wait no actually i want to know what cubits or in quantum computing",
+    "session_id": "1786125856239933000",
+    "response": "I think there might be a bit of a mix-up there. A cubit is an ancient unit of length, roughly the distance from your elbow to the tip of your middle finger. It has nothing to do with quantum computing.\n\nIn quantum computing, the basic unit of information is called a qubit, short for quantum bit. Unlike a regular bit which is either a zero or a one, a qubit can exist in a state of superposition, meaning it can represent both zero and one at the same time until it is measured. This allows quantum computers to process vast amounts of possibilities simultaneously."
   }
 ]
