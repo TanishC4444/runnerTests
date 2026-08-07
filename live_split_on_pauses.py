@@ -8,8 +8,16 @@ pause length (PAUSE_MS), not Vosk's own built-in endpointer.
 Correction step: ASR sometimes mishears a word as a real-but-wrong word.
 language_tool_python catches spelling AND grammar/context issues.
 
+Response step: each chunk is sent to Groq (Qwen 3.6 27B, see groq_responder.py)
+right here, in-process -- that's the primary "brain" now. The cloud Qwen
+watcher (qwen_watcher.yml / watch_and_respond.py) only gets triggered as a
+backup, automatically, the first time Groq comes back rate-limited or
+otherwise fails.
+
 Setup (run on your own machine, needs a mic):
-    pip install vosk pyaudio webrtcvad language_tool_python --break-system-packages
+    pip install vosk pyaudio webrtcvad language_tool_python requests --break-system-packages
+    export GROQ_API_KEY="gsk_..."   # Groq console -- required for the primary path
+    export GH_TOKEN="ghp_..."       # repo + workflow scope -- needed for the Qwen fallback trigger
 
 language_tool_python needs Java (JRE 17+):
     brew install openjdk
@@ -52,6 +60,10 @@ import requests
 import webrtcvad
 from vosk import Model, KaldiRecognizer
 import language_tool_python
+
+import groq_responder
+
+SESSION_ID = os.environ.get("RUNNER_SESSION_ID")
 
 # Local-only status file, shared with run_all.py so it can (a) show a live
 # dashboard and (b) know the instant you start talking again, so it can kill
@@ -205,23 +217,56 @@ def worker_loop(work_q: "queue.Queue", tool, t_start: float):
             sys.stdout.write("\r" + " " * 80 + "\r")
         print(f"[t={fmt(elapsed)} | +{fmt(since_last)} since last]  {fixed}{tag}")
 
-        pending.append(
-            {
-                "datetime": datetime.now().isoformat(timespec="microseconds"),
-                "talk_seconds": round(talk_seconds, 2),
-                "text": fixed,
-                "raw_text": raw_text,
-            }
-        )
+        entry = {
+            "datetime": datetime.now().isoformat(timespec="microseconds"),
+            "talk_seconds": round(talk_seconds, 2),
+            "text": fixed,
+            "raw_text": raw_text,
+        }
+        if SESSION_ID:
+            entry["session_id"] = SESSION_ID
         _write_local_status(last_user_text=fixed, last_user_ts=time.time())
+
+        # Try Groq (Qwen 3.6 27B) first -- fast enough to answer right here,
+        # no round trip through GitHub/Actions. Attach the reply to the
+        # entry BEFORE it's pushed: run_all.py's playback watcher already
+        # speaks any chunk that arrives with a "response" field, so this
+        # needs no changes on that side.
+        fallback_reason = None
+        try:
+            reply = groq_responder.ask_groq(fixed)
+            entry["response"] = reply
+            print(f"  [groq] {reply[:80]!r}")
+            _write_local_status(
+                conv_state="speaking", conv_state_ts=time.time(), last_reply_text=reply
+            )
+        except groq_responder.GroqRateLimited:
+            print("  [groq] rate limited -- falling back to Qwen for this chunk")
+            fallback_reason = "rate limited"
+        except Exception as e:
+            print(f"  [groq] request failed ({e}) -- falling back to Qwen for this chunk")
+            fallback_reason = str(e)
+
+        pending.append((entry, fallback_reason))
 
         # Retain failed entries in memory and flush them in order on the next
         # chunk. append_remote_chunk is idempotent, so ambiguous retries are safe.
         while pending:
+            pending_entry, pending_fallback_reason = pending[0]
             try:
-                append_remote_chunk(pending[0])
+                append_remote_chunk(pending_entry)
                 print("[sync] chunk appended")
                 pending.pop(0)
+                # Store the unanswered chunk before starting a new watcher.
+                # Otherwise a slow Actions startup can see the chunk in its
+                # initial snapshot, classify it as pre-session history, and
+                # never answer the request that caused the fallback.
+                if pending_fallback_reason is not None:
+                    fallback_ready = groq_responder.ensure_qwen_fallback(
+                        pending_fallback_reason
+                    )
+                    if fallback_ready:
+                        _write_local_status(qwen_fallback_triggered=True)
                 # Cloud watcher has the chunk now and will start generating --
                 # this is what makes the dashboard show "thinking".
                 _write_local_status(conv_state="thinking", conv_state_ts=time.time())

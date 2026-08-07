@@ -3,7 +3,12 @@ name: Qwen Chunk Watcher
 # NOT triggered per-chunk — one runner stays alive and works through
 # every chunk sequentially via its own poll loop.
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      session_id:
+        description: Session whose unanswered initial chunks should be handled
+        required: false
+        type: string
 
 # A previous session must not keep polling the same file with the same token.
 concurrency:
@@ -90,6 +95,7 @@ jobs:
           GH_TOKEN: ${{ secrets.RUNNER_PAT }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
+          RUNNER_SESSION_ID: ${{ inputs.session_id }}
           PYTHONUNBUFFERED: "1"
         run: |
           set -o pipefail
