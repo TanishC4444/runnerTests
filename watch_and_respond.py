@@ -74,8 +74,9 @@ SYSTEM_PREFIX = (
 REPLY_MAX_TOKENS = 200
 GENERATE_TIMEOUT_S = 180  # CPU-only runner; keep live conversation responsive
 
-POLL_SECONDS = 3
-QUIET_SECONDS = 2  # listener already emits only completed pause-delimited chunks
+POLL_SECONDS = 1.5  # git fetch is a plain subprocess call, not API-rate-limited --
+                     # safe to poll tighter than the old 3s
+QUIET_SECONDS = 1    # listener already emits only completed pause-delimited chunks
 GITHUB_TIMEOUT_S = 30
 PUSH_RETRIES = 5
 HEARTBEAT_SECONDS = 15

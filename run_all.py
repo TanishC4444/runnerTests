@@ -82,6 +82,62 @@ def speak_locally(text: str, tmp_name: str) -> str | None:
         print(f"[tts] local synthesis failed: {e}")
         return None
 
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def speak_locally_pipelined(text: str, session_start_ts: float, tmp_prefix: str = "qwen_reply"):
+    """Splits the reply into sentences and pipelines synth + playback:
+    while sentence N is playing, sentence N+1 is already being synthesized
+    on a background thread, instead of "synthesize the whole reply, then
+    play the whole reply" -- cuts time-to-first-sound on longer, multi-
+    sentence replies (which is most of them, per your logs).
+
+    Falls back to one-shot synthesis for single-sentence replies, since
+    pipelining a single chunk has no benefit and just adds complexity.
+    """
+    cleaned = clean_for_speech(text)
+    if not cleaned:
+        return
+    sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(cleaned) if s.strip()]
+    if len(sentences) <= 1:
+        t0 = time.time()
+        tmp_path = speak_locally(text, f"{tmp_prefix}.mp3")
+        print(f"  [timing] local TTS synth={time.time()-t0:.2f}s")
+        if tmp_path:
+            play_audio_interruptible(tmp_path, session_start_ts=session_start_ts)
+        return
+
+    # Synthesize sentence 0 synchronously (nothing to overlap it with yet),
+    # then kick off sentence 1's synthesis in the background immediately
+    # -- it renders while sentence 0 plays, so it's ready the instant
+    # playback catches up instead of causing a gap.
+    next_audio: dict[int, str | None] = {}
+    next_ready = threading.Event()
+
+    def _synth_ahead(idx: int, sentence: str):
+        next_audio[idx] = speak_locally(sentence, f"{tmp_prefix}_{idx}.mp3")
+        next_ready.set()
+
+    t0 = time.time()
+    current_path = speak_locally(sentences[0], f"{tmp_prefix}_0.mp3")
+    print(f"  [timing] first-sentence TTS synth={time.time()-t0:.2f}s (of {len(sentences)} sentences)")
+
+    for i, sentence in enumerate(sentences[1:], start=1):
+        next_ready.clear()
+        threading.Thread(target=_synth_ahead, args=(i, sentence), daemon=True).start()
+
+        if current_path:
+            finished = play_audio_interruptible(current_path, session_start_ts=session_start_ts)
+            if not finished:
+                return  # user barged in -- don't keep queuing more sentences
+
+        next_ready.wait(timeout=10)  # sentence i's synth should already be done or close to it
+        current_path = next_audio.get(i)
+
+    if current_path:
+        play_audio_interruptible(current_path, session_start_ts=session_start_ts)
+
 TOKEN = os.environ.get("GH_TOKEN")
 if not TOKEN:
     sys.exit("Set GH_TOKEN first (export GH_TOKEN=...)")
@@ -98,7 +154,7 @@ CHUNKS_LOG_FILE = os.path.join("chat", "Log 1", "chunks.json")
 
 LISTENER_SCRIPT = "live_split_on_pauses.py"
 READY_TIMEOUT_S = 240  # generous: cold model pull + Ollama boot can be slow
-RESPONSE_POLL_SECONDS = 3
+RESPONSE_POLL_SECONDS = 1.5  # git pull, not an API call -- safe to poll tighter
 GIT_LOCK_FILE = os.path.join(tempfile.gettempdir(), "runnerTests_git_sync.lock")
 
 # Same path live_split_on_pauses.py writes to. Local-only IPC, never touches
@@ -410,11 +466,7 @@ def response_watcher_loop(stop_event: threading.Event):
                 conv_state="speaking", conv_state_ts=time.time(), last_reply_text=reply
             )
 
-            t0 = time.time()
-            tmp_path = speak_locally(reply, "qwen_reply.mp3")
-            print(f"  [timing] local TTS synth={time.time()-t0:.2f}s")
-            if tmp_path:
-                play_audio_interruptible(tmp_path, session_start_ts=time.time())
+            speak_locally_pipelined(reply, session_start_ts=time.time())
 
             _write_local_status(conv_state="idle", conv_state_ts=time.time())
 

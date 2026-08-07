@@ -322,16 +322,28 @@ def live_split():
                 silence_run = 0
                 speech_run += 1
 
+                # Always check the partial now (not just when the preview is
+                # on) -- barge-in confirmation needs it.
+                partial = json.loads(rec.PartialResult()).get("partial", "")
+
                 # Debounced separately from chunk-boundary tracking above --
                 # a single noisy frame (cough, click, chair creak) no longer
-                # fires barge-in. Needs BARGE_IN_CONFIRM_FRAMES in a row.
+                # fires barge-in. Needs BARGE_IN_CONFIRM_FRAMES in a row
+                # AND Vosk must have actually recognized a real word by
+                # then -- webrtcvad alone can't tell "cough" from "speech",
+                # but Vosk producing a partial transcript means it heard
+                # something word-shaped, not just noise-shaped.
                 barge_in_confirm_run += 1
-                if not barge_in_signaled and barge_in_confirm_run >= BARGE_IN_CONFIRM_FRAMES:
+                has_recognized_word = bool(partial.strip())
+                if (
+                    not barge_in_signaled
+                    and barge_in_confirm_run >= BARGE_IN_CONFIRM_FRAMES
+                    and has_recognized_word
+                ):
                     barge_in_signaled = True
                     _write_local_status(mic_state="speech", mic_state_ts=time.time())
 
                 if SHOW_PARTIAL_PREVIEW:
-                    partial = json.loads(rec.PartialResult()).get("partial", "")
                     if partial and partial != last_partial:
                         last_partial = partial
                         sys.stdout.write(f"\r...{partial}" + " " * 10)
