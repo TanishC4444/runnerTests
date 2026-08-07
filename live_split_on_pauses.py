@@ -45,6 +45,7 @@ blob and retries optimistic-lock conflicts, so neither side performs local
 Git commits/rebases or overwrites the other's fields.
 """
 
+from __future__ import annotations
 import base64
 import json
 import os
