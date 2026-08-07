@@ -85,6 +85,7 @@ class _History:
 
 
 history = _History()
+last_usage = {}
 
 
 def ask_groq(user_text: str) -> str:
@@ -95,10 +96,16 @@ def ask_groq(user_text: str) -> str:
         raise RuntimeError("GROQ_API_KEY is not set")
 
     history.add("user", user_text)
+    lowered = user_text.lower()
+    adaptive_max_tokens = 120
+    if any(word in lowered for word in ("explain", "compare", "why", "how", "steps")):
+        adaptive_max_tokens = GROQ_MAX_TOKENS
+    elif len(user_text.split()) <= 8:
+        adaptive_max_tokens = 90
     payload = {
         "model": GROQ_MODEL,
         "messages": history.as_payload(),
-        "max_tokens": GROQ_MAX_TOKENS,
+        "max_tokens": adaptive_max_tokens,
         "temperature": 0.7,
     }
     # This is a real-time voice path, so use Qwen's non-thinking mode. It
@@ -134,6 +141,8 @@ def ask_groq(user_text: str) -> str:
             continue
 
         data = resp.json()
+        global last_usage
+        last_usage = data.get("usage") or {}
         reply = data["choices"][0]["message"]["content"].strip()
         if not reply:
             last_error = RuntimeError("Groq returned an empty message")

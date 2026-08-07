@@ -1,0 +1,32 @@
+{
+  "github": {
+    "default_owner": "TanishC4444",
+    "default_repository": "runnerTests",
+    "allowed_owners": ["TanishC4444"],
+    "allowed_repositories": ["*"],
+    "allow_create_repository": true,
+    "allow_workflow_file_edits": false,
+    "max_file_bytes": 262144
+  },
+  "models": {
+    "tool_router": "qwen/qwen3.6-27b",
+    "background_worker": "gpt-oss:20b",
+    "background_workflow": "agent_worker.yml"
+  },
+  "safeguards": {
+    "require_approval_for_writes": true,
+    "deny_destructive_tools": true,
+    "approval_ttl_seconds": 900
+  },
+  "skills_directory": "skills",
+  "mcp_servers": {
+    "github": {
+      "enabled": false,
+      "transport": "streamable_http",
+      "url": "https://api.githubcopilot.com/mcp/x/repos,issues,pull_requests,actions/readonly",
+      "read_only": true,
+      "auth": "github_oauth",
+      "toolsets": ["repos", "issues", "pull_requests", "actions"]
+    }
+  }
+}

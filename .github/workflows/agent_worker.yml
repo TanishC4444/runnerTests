@@ -1,0 +1,113 @@
+name: GPT-OSS Agent Worker
+run-name: GPT-OSS · ${{ inputs.session_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: Approved structured engineering plan
+        required: true
+        type: string
+      session_id:
+        description: Dashboard session identifier
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: gpt-oss-agent-${{ inputs.session_id }}
+  cancel-in-progress: false
+
+jobs:
+  work:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          sudo docker image prune --all --force || true
+
+      - name: Checkout approved base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Restore GPT-OSS Ollama cache
+        id: cache-model
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-gpt-oss-20b-linux-v1
+        continue-on-error: true
+
+      - name: Install and start Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          nohup ollama serve > /tmp/ollama-agent.log 2>&1 &
+          for i in $(seq 1 45); do
+            curl -sf http://127.0.0.1:11434/api/tags >/dev/null && break
+            sleep 1
+          done
+          ollama pull gpt-oss:20b
+          ollama list
+
+      - name: Save GPT-OSS Ollama cache
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-gpt-oss-20b-linux-v1
+        continue-on-error: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install worker dependency
+        run: python -m pip install -r requirements-runner.txt
+
+      - name: Run approved background task
+        env:
+          AGENT_TASK: ${{ inputs.task }}
+          AGENT_SESSION_ID: ${{ inputs.session_id }}
+          AGENT_MODEL: gpt-oss:20b
+          PYTHONUNBUFFERED: "1"
+        run: python3 runner_agent.py
+
+      - name: Publish changes as a pull request
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AGENT_BRANCH: agent/gpt-oss-${{ github.run_id }}
+          SESSION_ID: ${{ inputs.session_id }}
+        run: |
+          if git diff --quiet && [ -z "$(git status --porcelain)" ]; then
+            echo "No repository changes were produced."
+            exit 0
+          fi
+          git config user.name "GPT-OSS Agent"
+          git config user.email "gpt-oss-agent@users.noreply.github.com"
+          git switch -c "$AGENT_BRANCH"
+          git add --all
+          git commit -m "GPT-OSS task for $SESSION_ID"
+          git push --set-upstream origin "$AGENT_BRANCH"
+          gh pr create \
+            --base "${{ github.ref_name }}" \
+            --head "$AGENT_BRANCH" \
+            --title "GPT-OSS background task: $SESSION_ID" \
+            --body-file agent_output/pull_request.md
+
+      - name: Upload full worker result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-result-${{ github.run_id }}
+          path: agent_output/
+          retention-days: 14

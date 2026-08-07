@@ -1,1 +1,4 @@
 .env
+control_data/
+agent_output/
+*.mp3

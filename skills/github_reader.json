@@ -1,0 +1,10 @@
+{
+  "name": "github_reader",
+  "title": "GitHub reader",
+  "enabled": true,
+  "triggers": ["github", "repository", "repo", "workflow", "runner", "pull request", "issue"],
+  "mode": "read",
+  "model": "qwen/qwen3.6-27b",
+  "allowed_tools": ["github_list_repositories", "github_list_workflow_runs", "github_list_runners", "mcp__github__*"],
+  "instructions": "Use read-only GitHub or MCP tools to answer questions from evidence. Do not ask for information that a read tool can discover. Voice is allowed to use this skill."
+}

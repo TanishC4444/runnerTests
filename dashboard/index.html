@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Runner Control</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="rail">
+      <div class="brand"><span class="brand-mark"></span><span>Runner Control</span></div>
+      <button id="new-session" class="new-session">＋ New session</button>
+      <div class="rail-label">Sessions</div>
+      <nav id="session-list" class="sessions"></nav>
+      <div class="rail-bottom">
+        <div class="connection-row"><span id="github-dot" class="dot"></span><span id="github-label">GitHub disconnected</span></div>
+        <button id="open-settings" class="text-button">Connections & routing</button>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div>
+          <div class="eyebrow">ACTIVE SESSION</div>
+          <h1 id="session-title">Voice session</h1>
+        </div>
+        <div class="status-cluster">
+          <div class="model-chip"><span class="pulse green"></span><div><small>ROUTER</small><strong>Qwen 3.6 27B</strong></div></div>
+          <div class="model-chip"><span id="worker-pulse" class="pulse blue"></span><div><small>ACTIONS WORKER</small><strong>GPT-OSS 20B</strong></div></div>
+          <button id="ops-toggle" class="icon-button" aria-label="Toggle operations panel">Operations</button>
+        </div>
+      </header>
+
+      <section class="conversation">
+        <div id="empty-state" class="empty-state">
+          <div id="voice-orb" class="voice-orb"><span></span></div>
+          <h2 id="voice-state">Ready for a command</h2>
+          <p>Speak naturally or switch to typing. Repository changes wait for your approval.</p>
+        </div>
+        <div id="message-list" class="message-list"></div>
+      </section>
+
+      <section class="composer-wrap">
+        <div class="mode-toggle" role="group" aria-label="Input mode">
+          <button id="voice-mode" class="active">● Voice</button>
+          <button id="text-mode">⌨ Type</button>
+        </div>
+        <form id="command-form" class="composer">
+          <textarea id="command-input" rows="1" placeholder="Tell the agent what to do…" aria-label="Command"></textarea>
+          <button type="submit" id="send-button">Send</button>
+        </form>
+        <div class="safety-note"><span>Shielded</span> Writes require approval · destructive tools unavailable</div>
+      </section>
+    </main>
+
+    <aside id="ops-panel" class="ops-panel open">
+      <div class="ops-head"><div><div class="eyebrow">LIVE SYSTEM</div><h2>Operations</h2></div><button id="close-ops" class="close-button">×</button></div>
+
+      <section class="panel-section">
+        <div class="section-title"><span>Approvals</span><span id="approval-count" class="count">0</span></div>
+        <div id="approval-list" class="stack"><div class="muted-card">No actions waiting</div></div>
+      </section>
+
+      <section class="panel-section">
+        <div class="section-title"><span>GitHub activity</span><button id="refresh-github" class="mini-button">Refresh</button></div>
+        <div id="github-overview" class="stack"><div class="muted-card">Connect GitHub to inspect repositories and runners.</div></div>
+      </section>
+
+      <section class="panel-section">
+        <div class="section-title"><span>Usage</span><span class="live-label">SESSION</span></div>
+        <div id="usage-list" class="usage-list"></div>
+      </section>
+
+      <section class="panel-section">
+        <div class="section-title"><span>MCP servers</span></div>
+        <div id="mcp-list" class="stack"></div>
+      </section>
+
+      <section class="panel-section">
+        <div class="section-title"><span>Skills & routing</span></div>
+        <div id="skill-list" class="stack"></div>
+      </section>
+    </aside>
+  </div>
+
+  <dialog id="settings-dialog">
+    <form method="dialog" class="dialog-head"><div><div class="eyebrow">CONNECTIONS</div><h2>GitHub & model access</h2></div><button class="close-button">×</button></form>
+    <div class="dialog-body">
+      <div class="settings-card">
+        <div><strong>GitHub OAuth</strong><p>Tokens stay in memory and are never shown in the dashboard or logs.</p></div>
+        <div id="oauth-status" class="badge">Disconnected</div>
+        <label>OAuth App client ID<input id="oauth-client-id" autocomplete="off" placeholder="Iv1…"></label>
+        <button id="oauth-start" class="primary-button">Connect with device flow</button>
+        <div id="device-code" class="device-code hidden"></div>
+      </div>
+      <div class="settings-card">
+        <div><strong>API key status</strong><p>Key values are read from your environment and are never returned to this page.</p></div>
+        <div class="key-grid"><span>Groq API</span><span id="groq-key-status" class="badge">Unknown</span><span>GitHub</span><span id="github-key-status" class="badge">Unknown</span></div>
+      </div>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

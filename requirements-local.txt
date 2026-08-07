@@ -1,0 +1,6 @@
+edge-tts
+language-tool-python
+pyaudio
+requests
+vosk
+webrtcvad

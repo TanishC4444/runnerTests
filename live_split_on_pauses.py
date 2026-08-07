@@ -72,6 +72,7 @@ SESSION_ID = os.environ.get("RUNNER_SESSION_ID")
 # *transitions* only (not every audio frame) so it stays cheap.
 LOCAL_STATUS_FILE = os.path.join(tempfile.gettempdir(), "jarvis_local_status.json")
 LOCAL_RESPONSE_FILE = os.path.join(tempfile.gettempdir(), "jarvis_local_responses.jsonl")
+CONTROL_PLANE_VOICE_URL = "http://127.0.0.1:8765/api/voice-command"
 
 
 def _write_local_status(**fields):
@@ -93,14 +94,22 @@ def _write_local_status(**fields):
         pass
 
 
-def _queue_local_response(response_id: str, text: str):
+def _read_local_status() -> dict:
+    try:
+        with open(LOCAL_STATUS_FILE, "r", encoding="utf-8") as status_file:
+            return json.load(status_file)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _queue_local_response(response_id: str, text: str, user_text: str, usage: dict | None = None, logged: bool = False):
     """Hand a primary response directly to run_all.py for immediate speech.
 
     The remote chunks log remains the durable record, but local playback must
     not depend on a successful Git pull. Only this listener writes the queue,
     and run_all.py de-duplicates entries by response_id.
     """
-    event = {"response_id": response_id, "text": text}
+    event = {"response_id": response_id, "text": text, "user_text": user_text, "usage": usage or {}, "logged": logged}
     try:
         with open(LOCAL_RESPONSE_FILE, "a", encoding="utf-8") as response_file:
             response_file.write(json.dumps(event) + "\n")
@@ -110,6 +119,21 @@ def _queue_local_response(response_id: str, text: str):
         # synchronization, so a local IPC problem is not a model failure and
         # must not unnecessarily launch the backup model.
         print(f"  [talkback] could not queue immediate local speech: {e}")
+
+
+def _ask_control_plane(user_text: str) -> str:
+    response = requests.post(
+        CONTROL_PLANE_VOICE_URL,
+        json={"text": user_text},
+        timeout=150,
+    )
+    if not response.ok:
+        raise RuntimeError(f"control plane HTTP {response.status_code}: {response.text[:500]}")
+    payload = response.json()
+    reply = (payload.get("text") or payload.get("message") or "").strip()
+    if not reply:
+        raise RuntimeError("control plane returned no spoken reply")
+    return reply
 
 MODEL_PATH = "model"
 SAMPLE_RATE = 16000
@@ -254,17 +278,25 @@ def worker_loop(work_q: "queue.Queue", tool, t_start: float):
         # needs no changes on that side.
         fallback_reason = None
         try:
-            reply = groq_responder.ask_groq(fixed)
+            reply = _ask_control_plane(fixed)
             entry["response"] = reply
-            print(f"  [groq] {reply[:80]!r}")
-            _queue_local_response(entry["datetime"], reply)
+            print(f"  [qwen coordinator] {reply[:80]!r}")
+            _queue_local_response(entry["datetime"], reply, fixed, logged=True)
             _write_local_status(last_reply_text=reply)
-        except groq_responder.GroqRateLimited:
-            print("  [groq] rate limited -- falling back to Qwen for this chunk")
-            fallback_reason = "rate limited"
-        except Exception as e:
-            print(f"  [groq] request failed ({e}) -- falling back to Qwen for this chunk")
-            fallback_reason = str(e)
+        except Exception as control_error:
+            print(f"  [coordinator] unavailable ({control_error}); trying direct Groq voice path")
+            try:
+                reply = groq_responder.ask_groq(fixed)
+                entry["response"] = reply
+                print(f"  [groq direct] {reply[:80]!r}")
+                _queue_local_response(entry["datetime"], reply, fixed, groq_responder.last_usage)
+                _write_local_status(last_reply_text=reply)
+            except groq_responder.GroqRateLimited:
+                print("  [groq] rate limited -- falling back to Qwen for this chunk")
+                fallback_reason = "rate limited"
+            except Exception as e:
+                print(f"  [groq] request failed ({e}) -- falling back to Qwen for this chunk")
+                fallback_reason = str(e)
 
         pending.append((entry, fallback_reason))
 
@@ -359,12 +391,26 @@ def live_split():
                                # speech_run so debouncing barge-in never
                                # affects chunk-boundary timing/accuracy
     barge_in_signaled = False
+    input_mode = "voice"
+    last_mode_check = 0.0
 
     try:
         while True:
             frame = stream.read(FRAME_BYTES // 2, exception_on_overflow=False)
 
-            if muted.is_set():
+            now_monotonic = time.monotonic()
+            if now_monotonic - last_mode_check >= 0.25:
+                next_mode = _read_local_status().get("input_mode", "voice")
+                if next_mode != input_mode:
+                    input_mode = next_mode
+                    rec = KaldiRecognizer(vosk_model, SAMPLE_RATE)
+                    _write_local_status(
+                        mic_state="muted" if input_mode == "text" else "listening",
+                        mic_state_ts=time.time(),
+                    )
+                last_mode_check = now_monotonic
+
+            if muted.is_set() or input_mode == "text":
                 # keep pulling from the stream so the buffer doesn't
                 # overflow, but don't process anything while muted —
                 # also clear any in-progress chunk state so unmuting

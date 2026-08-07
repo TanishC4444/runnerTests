@@ -26,6 +26,7 @@ import asyncio
 import base64
 import http.server
 import json
+import mimetypes
 import os
 import platform
 import re
@@ -35,6 +36,8 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 try:
     import fcntl
@@ -43,6 +46,31 @@ except ImportError:  # Windows fallback; fcntl is available on macOS/Linux.
 
 import requests
 import edge_tts
+from control_plane import ControlPlane, ControlPlaneError
+
+
+def load_local_env(path: Path | None = None):
+    """Load simple KEY=VALUE entries without overwriting exported values."""
+    env_path = path or (Path(__file__).resolve().parent / ".env")
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
+load_local_env()
 
 # Speech now happens HERE, locally, not on the Actions runner. The runner
 # only ever sends text; this machine turns it into audio and plays it. That
@@ -142,13 +170,13 @@ def speak_locally_pipelined(text: str, session_start_ts: float, tmp_prefix: str 
         play_audio_interruptible(current_path, session_start_ts=session_start_ts)
 
 TOKEN = os.environ.get("GH_TOKEN")
-if not TOKEN:
-    sys.exit("Set GH_TOKEN first (export GH_TOKEN=...)")
 
 REPO = "TanishC4444/runnerTests"
 WORKFLOW_FILE = "qwen_watcher.yml"
 BASE = f"https://api.github.com/repos/{REPO}/actions/workflows/{WORKFLOW_FILE}"
-HEADERS = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json"}
+HEADERS = {"Accept": "application/vnd.github+json"}
+if TOKEN:
+    HEADERS["Authorization"] = f"Bearer {TOKEN}"
 
 STATUS_FILE = "chat/Log 1/status.json"
 STATUS_API_URL = f"https://api.github.com/repos/{REPO}/contents/{STATUS_FILE}"
@@ -167,6 +195,7 @@ GIT_LOCK_FILE = os.path.join(tempfile.gettempdir(), "runnerTests_git_sync.lock")
 LOCAL_STATUS_FILE = os.path.join(tempfile.gettempdir(), "jarvis_local_status.json")
 LOCAL_RESPONSE_FILE = os.path.join(tempfile.gettempdir(), "jarvis_local_responses.jsonl")
 DASHBOARD_PORT = 8765
+DASHBOARD_DIR = Path(__file__).resolve().parent / "dashboard"
 # How aggressively the playback watcher checks "did the user start talking
 # yet". 80ms feels effectively instant without busy-looping the CPU.
 BARGE_IN_POLL_S = 0.08
@@ -362,27 +391,105 @@ tick();
 
 
 class _DashboardHandler(http.server.BaseHTTPRequestHandler):
+    control_plane: ControlPlane | None = None
+
     def log_message(self, *args):
         pass  # keep the console clean; the dashboard doesn't need per-request logs
 
+    def _send_json(self, payload, status=200):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json(self):
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length > 1_000_000:
+            raise ControlPlaneError("Request body is too large")
+        return json.loads(self.rfile.read(length) or b"{}")
+
+    def _serve_asset(self, request_path: str):
+        relative = "index.html" if request_path in ("", "/") else request_path.lstrip("/")
+        candidate = (DASHBOARD_DIR / relative).resolve()
+        if DASHBOARD_DIR.resolve() not in candidate.parents and candidate != DASHBOARD_DIR.resolve():
+            self.send_error(404)
+            return
+        if not candidate.is_file():
+            candidate = DASHBOARD_DIR / "index.html"
+        body = candidate.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", mimetypes.guess_type(candidate.name)[0] or "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
-        if self.path.startswith("/status"):
-            body = json.dumps(_read_local_status()).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        else:
-            body = DASHBOARD_HTML.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        parsed = urlparse(self.path)
+        try:
+            if parsed.path == "/status":
+                return self._send_json(_read_local_status())
+            if parsed.path == "/api/snapshot":
+                return self._send_json(self.control_plane.snapshot(_read_local_status()))
+            if parsed.path.startswith("/api/sessions/") and parsed.path.endswith("/messages"):
+                session_id = parsed.path.split("/")[3]
+                return self._send_json({"messages": self.control_plane.sessions.messages(session_id)})
+            if parsed.path == "/api/github/overview":
+                query = parse_qs(parsed.query)
+                return self._send_json(self.control_plane.github_overview((query.get("owner") or [None])[0], (query.get("repo") or [None])[0]))
+            if parsed.path.startswith("/api/mcp/") and parsed.path.endswith("/tools"):
+                name = parsed.path.split("/")[3]
+                return self._send_json({"tools": self.control_plane.mcp.list_tools(name, refresh=True)})
+            return self._serve_asset(parsed.path)
+        except (ControlPlaneError, requests.RequestException, ValueError) as e:
+            return self._send_json({"error": str(e)}, 400)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        try:
+            payload = self._read_json()
+            if parsed.path == "/api/sessions":
+                return self._send_json(self.control_plane.create_session(payload.get("title", "New session")), 201)
+            if parsed.path == "/api/commands":
+                return self._send_json(self.control_plane.submit(payload.get("session_id", ""), payload.get("text", "")))
+            if parsed.path == "/api/voice-command":
+                result = self.control_plane.submit_voice(payload.get("text", ""))
+                return self._send_json(result)
+            if parsed.path.startswith("/api/approvals/"):
+                approval_id = parsed.path.split("/")[3]
+                return self._send_json(self.control_plane.resolve_approval(approval_id, bool(payload.get("approve"))))
+            if parsed.path == "/api/github/oauth/start":
+                return self._send_json(self.control_plane.auth.start_device_flow(payload.get("client_id", "")))
+            if parsed.path == "/api/github/oauth/poll":
+                return self._send_json(self.control_plane.auth.poll_device_flow())
+            if parsed.path == "/api/github/oauth/disconnect":
+                self.control_plane.auth.disconnect()
+                return self._send_json({"status": "disconnected"})
+            if parsed.path == "/api/input-mode":
+                mode = payload.get("mode")
+                if mode not in ("voice", "text"):
+                    raise ControlPlaneError("Input mode must be voice or text")
+                _write_local_status(
+                    input_mode=mode,
+                    mic_state="muted" if mode == "text" else "listening",
+                    mic_state_ts=time.time(),
+                )
+                return self._send_json({"mode": mode})
+            if parsed.path.startswith("/api/mcp/") and parsed.path.endswith("/toggle"):
+                name = parsed.path.split("/")[3]
+                return self._send_json(self.control_plane.set_mcp_enabled(name, bool(payload.get("enabled"))))
+            if parsed.path.startswith("/api/skills/") and parsed.path.endswith("/toggle"):
+                name = parsed.path.split("/")[3]
+                return self._send_json(self.control_plane.set_skill_enabled(name, bool(payload.get("enabled"))))
+            return self._send_json({"error": "Unknown endpoint"}, 404)
+        except (ControlPlaneError, requests.RequestException, ValueError, KeyError) as e:
+            return self._send_json({"error": str(e)}, 400)
 
 
-def start_dashboard_server() -> http.server.ThreadingHTTPServer:
+def start_dashboard_server(control_plane: ControlPlane) -> http.server.ThreadingHTTPServer:
+    _DashboardHandler.control_plane = control_plane
     server = http.server.ThreadingHTTPServer(("127.0.0.1", DASHBOARD_PORT), _DashboardHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -469,7 +576,7 @@ def git_pull_quiet():
         pass
 
 
-def response_watcher_loop(stop_event: threading.Event):
+def response_watcher_loop(stop_event: threading.Event, control_plane: ControlPlane):
     """Speak primary local replies and backup replies from chunks.json.
 
     Both paths use speak_locally_pipelined, whose player checks microphone
@@ -492,11 +599,14 @@ def response_watcher_loop(stop_event: threading.Event):
 
             reply = event["text"]
             print(f"[talkback:groq] {reply[:60]!r}")
+            control_plane.usage.add("qwen/qwen3.6-27b", event.get("usage"))
             _write_local_status(
                 conv_state="speaking", conv_state_ts=time.time(), last_reply_text=reply
             )
             speak_locally_pipelined(reply, session_start_ts=time.time(), tmp_prefix="groq_reply")
             _write_local_status(conv_state="idle", conv_state_ts=time.time())
+            if event.get("user_text") and not event.get("logged"):
+                control_plane.record_voice_turn(event["user_text"], reply)
 
         # Backup responses still arrive through the durable remote log, but
         # keep its slower Git polling separate from the 100ms local queue.
@@ -517,6 +627,8 @@ def response_watcher_loop(stop_event: threading.Event):
                 speak_locally_pipelined(reply, session_start_ts=time.time())
 
                 _write_local_status(conv_state="idle", conv_state_ts=time.time())
+                if entry.get("text"):
+                    control_plane.record_voice_turn(entry["text"], reply, model="qwen2.5:3b-backup")
             next_remote_poll = time.monotonic() + RESPONSE_POLL_SECONDS
 
         stop_event.wait(LOCAL_RESPONSE_POLL_SECONDS)
@@ -530,7 +642,8 @@ def main():
             os.remove(session_file)
         except FileNotFoundError:
             pass
-    start_dashboard_server()
+    control_plane = ControlPlane()
+    start_dashboard_server(control_plane)
 
     # Reset any stale "ready" flag from a previous session so that if the
     # Qwen fallback does get triggered later, wait_for_ready-style checks
@@ -556,7 +669,7 @@ def main():
     listener = subprocess.Popen([sys.executable, LISTENER_SCRIPT], env=listener_env)
 
     stop_event = threading.Event()
-    responder = threading.Thread(target=response_watcher_loop, args=(stop_event,), daemon=True)
+    responder = threading.Thread(target=response_watcher_loop, args=(stop_event, control_plane), daemon=True)
     responder.start()
 
     print(f"\nReady. Idle until you speak. Dashboard: http://localhost:{DASHBOARD_PORT}")
