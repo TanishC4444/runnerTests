@@ -27,6 +27,8 @@
     "datetime": "2026-08-06T20:13:23.395708",
     "talk_seconds": 1.17,
     "text": "Hey man how are you",
-    "raw_text": "hey man how are you"
+    "raw_text": "hey man how are you",
+    "response": "I'm doing well! How can I assist you today?",
+    "response_audio_path": "chat/Log 1/audio/1b7613fe7fce8fb5.mp3"
   }
 ]
