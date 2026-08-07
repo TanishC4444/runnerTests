@@ -22,19 +22,25 @@ jobs:
           token: ${{ secrets.RUNNER_PAT }}
       - name: Install complete Ollama runtime
         run: |
-          # Do not cache /usr/local/bin/ollama separately. The executable and
-          # lib/ollama/llama-server are one installation unit; restoring only
-          # part of it produces an Ollama API that answers health checks but
-          # returns HTTP 500 for every generation request.
           curl -fsSL https://ollama.com/install.sh | sh
           ollama --version
 
-          # Keep Ollama under the runner account so ~/.ollama/models is the
-          # model directory restored/saved below. The installer can start a
-          # system service under a different account, so stop that instance.
+          echo "CPU cores visible to this runner:"
+          nproc
+          CORES=$(nproc)
+
           sudo systemctl stop ollama 2>/dev/null || true
+
+          # Ollama's own core auto-detection can under-count inside a CI
+          # container -- pin it explicitly instead of trusting the default,
+          # and disable multi-model/parallel-request overhead we don't need
+          # for one sequential conversation (frees that memory/scheduling
+          # headroom for the single model actually in use).
+          export OLLAMA_NUM_THREAD="$CORES"
+          export OLLAMA_NUM_PARALLEL=1
+          export OLLAMA_MAX_LOADED_MODELS=1
+
           nohup ollama serve > ollama.log 2>&1 &
-          # wait for the server to come up
           ready=""
           for i in $(seq 1 30); do
             if curl -sf http://localhost:11434/api/tags > /dev/null; then
@@ -53,23 +59,12 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ~/.ollama/models
-          # v2 forces one clean model download instead of trusting the old
-          # manifest/blob cache that produced a generation-time HTTP 500.
           key: ollama-qwen2.5-3b-v2
         continue-on-error: true
       - name: Verify/pull Qwen 2.5 3B
         run: |
-          # Pull even after a cache hit. Ollama reuses valid blobs but verifies
-          # the manifest and restores anything missing or damaged.
           ollama pull qwen2.5:3b
       - name: Save Ollama model cache
-        # Save it right here, immediately after the pull -- not deferred
-        # to the job's post-cleanup phase. run_all.py cancels this
-        # workflow run via the API on every session, and a cancelled
-        # job's post-steps get a very short grace period, which isn't
-        # enough time for a multi-GB cache upload to finish. Saving now,
-        # before the long watcher-loop step (the one that gets
-        # cancelled) even starts, means the cache always gets written.
         if: steps.cache-ollama.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
@@ -80,16 +75,22 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          # Now that edge_tts is gone from this side, the dependency list
+          # is tiny (just requests) -- but caching pip's own download/wheel
+          # cache still shaves a couple seconds of "resolve + download" off
+          # every cold job, basically free to leave on.
+          cache: "pip"
+          cache-dependency-path: requirements-runner.txt
       - name: Install Python deps
         run: |
-          pip install requests edge-tts
-          python -c "import requests, edge_tts; print('requests', requests.__version__); print('edge_tts OK, module at', edge_tts.__file__)"
+          pip install -r requirements-runner.txt
+          python -c "import requests; print('requests', requests.__version__)"
       - name: Run watcher loop
         env:
           GH_TOKEN: ${{ secrets.RUNNER_PAT }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
-          PYTHONUNBUFFERED: "1"   # step logs are not a TTY -- without this, prints can sit buffered and invisible
+          PYTHONUNBUFFERED: "1"
         run: |
           set -o pipefail
           dump_ollama_log() {

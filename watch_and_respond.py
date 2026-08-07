@@ -2,60 +2,71 @@
 Runs on the Actions runner itself. Fetches the remote branch and reads
 chunks.json directly from that fetched Git commit (using the file's blob SHA
 to detect changes), and for every new entry created during the current session:
-  1. waits until 5s pass with no further change (so it doesn't respond
-     mid-thought if you're still talking / more chunks are still landing)
+  1. waits until QUIET_SECONDS pass with no further change (so it doesn't
+     respond mid-thought if you're still talking / more chunks are still
+     landing)
   2. sends the text to the locally-running Qwen 2.5 3B (via Ollama)
-  3. converts the reply to speech (gTTS, saved as mp3, base64-embedded
-     in the JSON so it survives as one file — no binary blobs to juggle)
-  4. commits the updated file back to the repo
+  3. commits the reply text back to the repo
+
+TEXT ONLY. No TTS runs here anymore -- speech happens locally on run_all.py's
+side instead (see that file). That removes edge_tts as a runner dependency
+entirely (pip install is now just `requests`) and removes the audio-file
+push this file used to do per response.
 
 On startup, once Ollama/the model are actually confirmed reachable, it
-also pushes a short verbal "ready" cue to a separate status.json (see
-STATUS_FILE below) so the local side (run_all.py) can play it and only
-start listening once Qwen is genuinely ready -- rather than guessing.
-status.json is kept separate from chunks.json on purpose: chunks.json is
-already being written independently by the local listener, and mixing a
-second, differently-shaped writer into that file would just recreate the
-same race condition run_all.py/live_split_on_pauses.py had to work around.
+pushes a short "ready" signal to a separate status.json (see STATUS_FILE
+below) so the local side (run_all.py) knows Qwen is genuinely ready --
+rather than guessing. status.json is kept separate from chunks.json on
+purpose: chunks.json is already being written independently by the local
+listener, and mixing a second, differently-shaped writer into that file
+would just recreate the same race condition run_all.py/live_split_on_pauses.py
+had to work around.
 
 Stops only when the job is cancelled (by you, via the cancel-run API) or
 the workflow's own timeout is hit.
 """
 
-import asyncio
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
+import threading
 import time
 
 import requests
-import edge_tts
 
 # GitHub Actions doesn't attach a TTY to step output, so Python buffers
 # stdout by default -- prints can sit invisible for a long time instead
-# of showing up as they happen. Force line buffering so the log is live.
+# of showing up as they happen. Force line buffering so the log is live,
+# which also matters now: run_all.py polls this exact log stream for
+# RESULT:: lines (see below), so buffered/delayed output directly adds
+# to response latency, not just log readability.
 sys.stdout.reconfigure(line_buffering=True)
 
-print(f"[deps] requests {requests.__version__}, edge_tts import OK", flush=True)
-
-# Jarvis-ish: calm, deep, British male voice. Full voice list: `edge-tts --list-voices`.
-# Other reasonable picks: "en-GB-ThomasNeural" (younger/brisker, more clipped RP),
-# "en-GB-RyanNeural" (previous default, deeper/slower delivery).
-TTS_VOICE = "en-GB-ThomasNeural"
-TTS_RATE = "+32%"   # bumped further; drop back toward +18% if it starts sounding rushed/clipped
+CPU_COUNT = os.cpu_count() or 4
+print(f"[deps] requests {requests.__version__}, {CPU_COUNT} CPU cores visible", flush=True)
 
 TOKEN = os.environ["GH_TOKEN"]
 REPO = os.environ["GITHUB_REPOSITORY"]  # "owner/repo"
 FILE_PATH = "chat/Log 1/chunks.json"
 STATUS_FILE = "chat/Log 1/status.json"
-AUDIO_DIR = "chat/Log 1/audio"  # one small file per response, NOT embedded in chunks.json
 API_URL = f"https://api.github.com/repos/{REPO}/contents/{FILE_PATH}"
 STATUS_API_URL = f"https://api.github.com/repos/{REPO}/contents/{STATUS_FILE}"
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "qwen2.5:3b"
+
+# Told explicitly not to use markdown -- this used to come out as literal
+# asterisks/hashes/backticks when spoken aloud on the local side. Cheaper
+# to stop it at the source than to strip it after the fact every time.
+SYSTEM_PREFIX = (
+    "You are a voice assistant. Reply in plain spoken English only: full "
+    "sentences, normal punctuation, no markdown, no asterisks, no bullet "
+    "points, no headers, no code fences. Someone is going to hear this "
+    "read aloud, not read it on a screen.\n\n"
+)
 
 # Ollama defaults num_predict (max generated tokens) to 128 unless told
 # otherwise, which is why replies felt clipped -- this gives real replies
@@ -165,40 +176,7 @@ def entry_key(entry: dict) -> tuple:
     )
 
 
-def entry_id(key: tuple) -> str:
-    """Filesystem-safe id derived from entry_key, used as the audio filename."""
-    import hashlib
-    return hashlib.sha1("|".join(str(k) for k in key).encode("utf-8")).hexdigest()[:16]
-
-
-def push_audio_file(filename: str, audio_bytes: bytes) -> str:
-    """Uploads ONE small audio file (not the whole chunks.json array).
-
-    This is the fix for chunks.json growing unbounded: previously every
-    response embedded its full base64 mp3 INSIDE the shared entries array,
-    so every subsequent push (new chunk OR new response) re-serialized and
-    re-uploaded the ENTIRE conversation's audio history every single time --
-    strictly growing payload size per exchange. Each response's audio now
-    gets its own tiny file; chunks.json only ever stores a path string.
-    Returns the relative path stored in the entry.
-    """
-    path = f"{AUDIO_DIR}/{filename}"
-    url = f"https://api.github.com/repos/{REPO}/contents/{path}"
-    resp = requests.put(
-        url,
-        headers=gh_headers(),
-        json={
-            "message": "Add response audio",
-            "content": base64.b64encode(audio_bytes).decode("utf-8"),
-            "branch": BRANCH,
-        },
-        timeout=GITHUB_TIMEOUT_S,
-    )
-    resp.raise_for_status()
-    return path
-
-
-def push_response(key: tuple, reply: str, audio_path: str | None):
+def push_response(key: tuple, reply: str):
     """Merge one response into the newest file and push it immediately.
 
     The microphone can add another chunk while Qwen is generating. Re-fetching
@@ -214,13 +192,9 @@ def push_response(key: tuple, reply: str, audio_path: str | None):
             return
 
         target["response"] = reply
-        if audio_path:
-            # path only -- the actual bytes already live in their own small
-            # file (see push_audio_file), not embedded here.
-            target["response_audio_path"] = audio_path
 
         try:
-            push_file(entries, sha, "Add Qwen response + TTS audio")
+            push_file(entries, sha, "Add Qwen response")
             return
         except requests.HTTPError as e:
             if e.response is None or e.response.status_code not in (409, 422):
@@ -234,12 +208,50 @@ def push_response(key: tuple, reply: str, audio_path: str | None):
     raise RuntimeError("could not save response after repeated chunk-file conflicts")
 
 
-def ask_qwen(text: str, max_tokens: int | None = None) -> str:
-    payload = {"model": MODEL, "prompt": text, "stream": False}
+def push_response_async(key: tuple, reply: str):
+    """Runs on a background thread. The RESULT:: log line (see main loop)
+    already told run_all.py the answer -- this call is now purely for the
+    durable written record in chunks.json, so it no longer needs to sit on
+    the critical path between "reply generated" and "you hear it"."""
+    def _worker():
+        t0 = time.time()
+        try:
+            push_response(key, reply)
+            print(f"  [async] response committed to chunks.json in {time.time()-t0:.2f}s", flush=True)
+        except Exception as e:
+            print(f"  [async] failed to save response (log line still stands): {e}", flush=True)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+_MARKDOWN_STRIP_RE = re.compile(r"[*_`#]+|^\s*[-•]\s+", re.MULTILINE)
+
+
+def clean_reply(text: str) -> str:
+    """Belt-and-suspenders cleanup in case Qwen ignores SYSTEM_PREFIX and
+    emits markdown anyway -- strips the literal symbols so they never get
+    spoken aloud as "asterisk" etc. on the local TTS side."""
+    text = _MARKDOWN_STRIP_RE.sub("", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)  # [label](url) -> label
+    text = re.sub(r"\n{2,}", " ", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
+def ask_qwen(text: str, max_tokens: int | None = None, use_system_prefix: bool = True) -> str:
+    prompt = (SYSTEM_PREFIX + text) if use_system_prefix else text
+    options = {
+        # Ollama's own core auto-detection is inconsistent on GitHub-hosted
+        # runners (containerized cgroup CPU limits vs. host nproc can
+        # disagree) -- pin it explicitly so llama.cpp actually spreads
+        # across every visible core instead of guessing low.
+        "num_thread": CPU_COUNT,
+    }
     if max_tokens is not None:
         # caps generation length -- keeps the readiness warm-up fast on
         # a CPU-only runner; real replies pass REPLY_MAX_TOKENS instead
-        payload["options"] = {"num_predict": max_tokens}
+        options["num_predict"] = max_tokens
+    payload = {"model": MODEL, "prompt": prompt, "stream": False, "options": options}
     resp = requests.post(OLLAMA_URL, json=payload, timeout=GENERATE_TIMEOUT_S)
     if not resp.ok:
         # requests' default HTTPError only includes the status line. Ollama
@@ -253,21 +265,7 @@ def ask_qwen(text: str, max_tokens: int | None = None) -> str:
     reply = resp.json().get("response", "").strip()
     if not reply:
         raise RuntimeError("Ollama returned HTTP 200 but an empty response")
-    return reply
-
-
-async def _edge_tts_save(text: str, path: str) -> None:
-    communicate = edge_tts.Communicate(text, voice=TTS_VOICE, rate=TTS_RATE)
-    await communicate.save(path)
-
-
-def tts_bytes(text: str, lang: str = "en") -> bytes:
-    """lang kept in the signature so call sites don't need to change;
-    voice/rate/accent are controlled by TTS_VOICE/TTS_RATE above instead."""
-    tmp_path = f"/tmp/reply_{lang}.mp3"
-    asyncio.run(_edge_tts_save(text, tmp_path))
-    with open(tmp_path, "rb") as f:
-        return f.read()
+    return clean_reply(reply)
 
 
 def fetch_status():
@@ -307,7 +305,7 @@ def push_status(payload: dict, message: str):
 
 
 def announce_ready():
-    """Verbal cue: TTS a short line and push it to status.json.
+    """Text-only ready signal now -- run_all.py speaks it locally itself.
 
     The warm-up call caps output at a handful of tokens (num_predict) --
     a full free-length generation on a CPU-only Actions runner can take
@@ -317,7 +315,7 @@ def announce_ready():
     print("[ready] sending a capped warm-up prompt to confirm Qwen is loaded...", flush=True)
     t0 = time.time()
     try:
-        ask_qwen("Say 'ready'.", max_tokens=5)
+        ask_qwen("Say 'ready'.", max_tokens=5, use_system_prefix=False)
     except Exception as e:
         error = f"Qwen warm-up failed: {e}"
         print(f"[ready] {error}", flush=True)
@@ -339,24 +337,14 @@ def announce_ready():
     print(f"[ready] warm-up call answered in {time.time() - t0:.1f}s", flush=True)
 
     try:
-        audio_b64 = base64.b64encode(tts_bytes("I'm ready, go ahead.", lang="en")).decode("utf-8")
-        print("[ready] TTS generated.", flush=True)
-    except Exception as e:
-        # Speech is optional; a TTS outage should not disguise a healthy
-        # local model as a failed model startup.
-        print(f"[ready] TTS failed, using text-only ready signal: {e}", flush=True)
-        audio_b64 = None
-
-    try:
         push_status(
             {
                 "ready": True,
-                "ready_audio_b64": audio_b64,
                 "ready_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             },
             "Qwen watcher ready",
         )
-        print("[ready] pushed verbal ready signal to status.json.", flush=True)
+        print("[ready] pushed ready signal to status.json.", flush=True)
     except Exception as e:
         # Don't let a failed ready-ping take down the whole watcher --
         # chunk responses can still work even if this push fails.
@@ -436,32 +424,28 @@ def main():
                     handled.add(key)
                     continue
 
+                t_start = time.time()
                 print(f"Responding to: {text[:60]!r}", flush=True)
                 try:
                     t0 = time.time()
                     reply = ask_qwen(text, max_tokens=REPLY_MAX_TOKENS)
-                    print(f"  generated in {time.time() - t0:.1f}s: {reply[:60]!r}", flush=True)
+                    generate_s = time.time() - t0
+                    print(f"  [timing] generate={generate_s:.2f}s -> {reply[:60]!r}", flush=True)
                 except Exception as e:
                     print(f"  generation failed: {e}", flush=True)
                     handled.add(key)
                     continue
 
-                audio_path = None
-                try:
-                    audio_bytes = tts_bytes(reply, lang="en")
-                    filename = f"{entry_id(key)}.mp3"
-                    audio_path = push_audio_file(filename, audio_bytes)
-                    print(f"  audio pushed separately: {audio_path}", flush=True)
-                except Exception as e:
-                    print(f"  TTS/audio push failed; saving text response only: {e}", flush=True)
+                # This is the line run_all.py's log poller looks for -- the
+                # reply reaches you as soon as this print flushes, not after
+                # a full git-commit round trip. entry_key's datetime field
+                # alone is enough to match it back to the right chunk locally.
+                result_line = json.dumps({"datetime": entry.get("datetime"), "text": reply})
+                print(f"RESULT::{result_line}", flush=True)
+                print(f"  [timing] total_before_git={time.time()-t_start:.2f}s (git push now async)", flush=True)
 
-                try:
-                    push_response(key, reply, audio_path)
-                    print("  response pushed", flush=True)
-                except Exception as e:
-                    print(f"  failed to save response: {e}", flush=True)
-                finally:
-                    handled.add(key)
+                push_response_async(key, reply)
+                handled.add(key)
 
             # Refresh after the batch. A new chunk may have landed while Qwen
             # was generating; keep it pending instead of accidentally treating

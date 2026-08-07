@@ -17,11 +17,13 @@ Setup:
     export GH_TOKEN="your_new_token"   # repo + workflow scope
 """
 
+import asyncio
 import base64
 import http.server
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import tempfile
@@ -35,6 +37,48 @@ except ImportError:  # Windows fallback; fcntl is available on macOS/Linux.
     fcntl = None
 
 import requests
+import edge_tts
+
+# Speech now happens HERE, locally, not on the Actions runner. The runner
+# only ever sends text; this machine turns it into audio and plays it. That
+# cuts out the whole audio-file-over-git round trip for every single reply.
+# Voice list: `edge-tts --list-voices`. Alternatives: "en-GB-RyanNeural"
+# (deeper/slower), "en-GB-SoniaNeural" (female RP).
+TTS_VOICE = "en-GB-ThomasNeural"
+TTS_RATE = "+20%"   # dial toward +30% for snappier, back toward +10% if it sounds rushed
+
+_MARKDOWN_STRIP_RE = re.compile(r"[*_`#]+|^\s*[-•]\s+", re.MULTILINE)
+
+
+def clean_for_speech(text: str) -> str:
+    """Strip markdown symbols before they get spoken as literal words
+    ("asterisk", "pound sign", etc.). watch_and_respond.py already asks
+    Qwen not to produce markdown and does its own cleanup server-side --
+    this is the second line of defense, cheap insurance either way."""
+    text = _MARKDOWN_STRIP_RE.sub("", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip()
+
+
+async def _edge_tts_save(text: str, path: str) -> None:
+    communicate = edge_tts.Communicate(text, voice=TTS_VOICE, rate=TTS_RATE)
+    await communicate.save(path)
+
+
+def speak_locally(text: str, tmp_name: str) -> str | None:
+    """Synthesizes text to a local temp mp3 and returns its path, or None
+    if TTS failed (caller should treat speech as optional, not fatal)."""
+    cleaned = clean_for_speech(text)
+    if not cleaned:
+        return None
+    tmp_path = os.path.join(tempfile.gettempdir(), tmp_name)
+    try:
+        asyncio.run(_edge_tts_save(cleaned, tmp_path))
+        return tmp_path
+    except Exception as e:
+        print(f"[tts] local synthesis failed: {e}")
+        return None
 
 TOKEN = os.environ.get("GH_TOKEN")
 if not TOKEN:
@@ -52,7 +96,6 @@ CHUNKS_LOG_FILE = os.path.join("chat", "Log 1", "chunks.json")
 
 LISTENER_SCRIPT = "live_split_on_pauses.py"
 READY_TIMEOUT_S = 240  # generous: cold model pull + Ollama boot can be slow
-RESPONSE_POLL_SECONDS = 3
 GIT_LOCK_FILE = os.path.join(tempfile.gettempdir(), "runnerTests_git_sync.lock")
 
 # Same path live_split_on_pauses.py writes to. Local-only IPC, never touches
@@ -109,6 +152,38 @@ def get_latest_run_id():
     resp.raise_for_status()
     runs = resp.json()["workflow_runs"]
     return runs[0]["id"] if runs else None
+
+
+def get_job_id(run_id) -> int | None:
+    """The job-level logs endpoint (unlike the run-level one) returns raw
+    text for an in_progress job, which is what makes fast log-polling
+    possible at all -- but it needs a job_id, not just a run_id."""
+    url = f"https://api.github.com/repos/{REPO}/actions/runs/{run_id}/jobs"
+    resp = requests.get(url, headers=HEADERS)
+    resp.raise_for_status()
+    for job in resp.json().get("jobs", []):
+        if job.get("status") in ("in_progress", "queued"):
+            return job["id"]
+    return None
+
+
+_RESULT_RE = re.compile(r"^RESULT::(\{.*\})\s*$", re.MULTILINE)
+
+
+def fetch_new_log_text(job_id: int, already_seen_len: int) -> tuple[str, int]:
+    """Returns (new_text_suffix, new_total_len). Job logs are append-only
+    while the job runs, so tracking the previously-seen length and slicing
+    is enough to get "what's new" without re-parsing the whole thing."""
+    url = f"https://api.github.com/repos/{REPO}/actions/jobs/{job_id}/logs"
+    resp = requests.get(url, headers=HEADERS, allow_redirects=True, timeout=15)
+    if resp.status_code == 404:
+        # job hasn't produced a log blob yet, or already rotated past this id
+        return "", already_seen_len
+    resp.raise_for_status()
+    full_text = resp.text
+    if len(full_text) <= already_seen_len:
+        return "", already_seen_len
+    return full_text[already_seen_len:], len(full_text)
 
 
 def cancel_run(run_id):
@@ -300,14 +375,11 @@ def wait_for_ready(timeout_s: int = READY_TIMEOUT_S):
         if payload and payload.get("error"):
             raise RuntimeError(payload["error"])
         if payload and payload.get("ready"):
-            audio_b64 = payload.get("ready_audio_b64")
-            if audio_b64:
-                tmp_path = os.path.join(tempfile.gettempdir(), "qwen_ready.mp3")
-                with open(tmp_path, "wb") as f:
-                    f.write(base64.b64decode(audio_b64))
+            tmp_path = speak_locally("I'm ready, go ahead.", "qwen_ready.mp3")
+            if tmp_path:
                 play_audio_interruptible(tmp_path, session_start_ts=time.time())
             else:
-                print("[cloud] Qwen is ready (no audio cue was included).")
+                print("[cloud] Qwen is ready (local TTS unavailable, text-only).")
             return
         now = time.time()
         if now - last_heartbeat >= 15:
@@ -343,47 +415,85 @@ def git_pull_quiet():
         pass
 
 
+_played_lock = threading.Lock()
+_played: set[str] = set()  # datetime strings already spoken, shared across both watcher threads
+
+
+def _speak_reply_once(reply: str, entry_datetime: str, source: str, t_reply_ready: float | None = None):
+    """Guards against speaking the same reply twice -- the fast log-based
+    path and the slower git-fallback path both funnel through here."""
+    with _played_lock:
+        if entry_datetime in _played:
+            return
+        _played.add(entry_datetime)
+
+    latency_note = ""
+    if t_reply_ready is not None:
+        latency_note = f" (seen {time.time()-t_reply_ready:.2f}s after generated, clock skew included)"
+    print(f"[talkback:{source}] {reply[:60]!r}{latency_note}")
+    _write_local_status(conv_state="speaking", conv_state_ts=time.time(), last_reply_text=reply)
+
+    t0 = time.time()
+    tmp_path = speak_locally(reply, "qwen_reply.mp3")
+    print(f"  [timing] local TTS synth={time.time()-t0:.2f}s")
+    if tmp_path:
+        play_audio_interruptible(tmp_path, session_start_ts=time.time())
+
+    _write_local_status(conv_state="idle", conv_state_ts=time.time())
+
+
+def log_watcher_loop(job_id: int, stop_event: threading.Event):
+    """FAST path: polls the runner's own live job log for RESULT:: lines
+    instead of waiting on a git commit round trip. This is what actually
+    cuts latency -- the git-based response_watcher_loop below still runs,
+    but now purely as a slower durable-record fallback (e.g. if a log line
+    is missed due to GitHub's internal log-buffering lag or this poll
+    catching a job right as it transitions/rotates)."""
+    seen_len = 0
+    LOG_POLL_SECONDS = 1.5
+    while not stop_event.is_set():
+        try:
+            new_text, seen_len = fetch_new_log_text(job_id, seen_len)
+        except Exception as e:
+            print(f"[log-watch] poll failed, will retry: {e}")
+            stop_event.wait(LOG_POLL_SECONDS)
+            continue
+
+        for match in _RESULT_RE.finditer(new_text):
+            try:
+                payload = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                continue
+            _speak_reply_once(
+                payload.get("text", ""),
+                payload.get("datetime", ""),
+                source="log",
+            )
+
+        stop_event.wait(LOG_POLL_SECONDS)
+
+
 def response_watcher_loop(stop_event: threading.Event):
-    """Background thread: periodically checks chunks.json for replies
-    that have landed from the cloud watcher and plays them out loud --
-    this is what actually makes Qwen "talk back" instead of you having
-    to go open the file yourself. Runs independently of the listener's
-    own git activity, which only happens when you're the one speaking."""
-    # seed with anything already answered from a previous session so we
-    # don't replay old responses on startup
-    played = {e.get("datetime") for e in load_chunks() if "response" in e}
+    """SLOW fallback path: still reads chunks.json via git pull, same as
+    before -- but now only needed as a durable-record catch for whatever
+    the fast log_watcher_loop misses (buffering lag, a job restart, etc).
+    _speak_reply_once's dedup means it's a no-op for anything already
+    spoken via the log path, so this just quietly confirms the record."""
+    played_at_startup = {e.get("datetime") for e in load_chunks() if "response" in e}
+    with _played_lock:
+        _played.update(played_at_startup)
+
+    GIT_FALLBACK_POLL_SECONDS = 8  # no longer time-critical; log path handles latency
 
     while not stop_event.is_set():
         git_pull_quiet()
         for entry in load_chunks():
             key = entry.get("datetime")
-            if key in played or "response" not in entry:
+            if "response" not in entry:
                 continue
-            played.add(key)
+            _speak_reply_once(entry.get("response", ""), key, source="git-fallback")
 
-            reply = entry.get("response", "")
-            print(f"[talkback] {reply[:60]!r}")
-            _write_local_status(
-                conv_state="speaking", conv_state_ts=time.time(), last_reply_text=reply
-            )
-
-            # New format: a path to a small file that git pull already put
-            # on disk locally -- read it directly, no base64 decode needed.
-            audio_path = entry.get("response_audio_path")
-            if audio_path and os.path.exists(audio_path):
-                play_audio_interruptible(audio_path, session_start_ts=time.time())
-            else:
-                # Back-compat with older entries saved before this change.
-                audio_b64 = entry.get("response_audio_b64")
-                if audio_b64:
-                    tmp_path = os.path.join(tempfile.gettempdir(), "qwen_reply.mp3")
-                    with open(tmp_path, "wb") as f:
-                        f.write(base64.b64decode(audio_b64))
-                    play_audio_interruptible(tmp_path, session_start_ts=time.time())
-
-            _write_local_status(conv_state="idle", conv_state_ts=time.time())
-
-        stop_event.wait(RESPONSE_POLL_SECONDS)
+        stop_event.wait(GIT_FALLBACK_POLL_SECONDS)
 
 
 def main():
@@ -419,7 +529,15 @@ def main():
     print("[local] starting mic listener...")
     listener = subprocess.Popen([sys.executable, LISTENER_SCRIPT])
 
+    job_id = get_job_id(run_id)
     stop_event = threading.Event()
+    if job_id:
+        print(f"[cloud] job id {job_id} -- fast log-based responses enabled.")
+        log_thread = threading.Thread(target=log_watcher_loop, args=(job_id, stop_event), daemon=True)
+        log_thread.start()
+    else:
+        print("[cloud] could not resolve job id; falling back to git-only response timing.")
+
     responder = threading.Thread(target=response_watcher_loop, args=(stop_event,), daemon=True)
     responder.start()
 
