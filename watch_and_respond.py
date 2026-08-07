@@ -81,6 +81,7 @@ GITHUB_TIMEOUT_S = 30
 PUSH_RETRIES = 5
 HEARTBEAT_SECONDS = 15
 BRANCH = os.environ.get("GITHUB_REF_NAME", "main")
+SESSION_ID = os.environ.get("RUNNER_SESSION_ID")
 REMOTE_REF = f"refs/remotes/origin/{BRANCH}"
 
 
@@ -338,21 +339,34 @@ def announce_ready():
 def main():
     print(f"Watching {FILE_PATH} in {REPO}, polling every {POLL_SECONDS}s...")
 
-    # Anything already present belongs to an earlier session. Mark it before
-    # announcing readiness so this run answers only chunks recorded after the
-    # user hears the ready cue instead of draining an old backlog first.
+    # Ignore old history, but retain unanswered chunks carrying the session ID
+    # that launched this watcher. A lazy fallback is dispatched only after its
+    # first failed chunk is stored, so that chunk is necessarily present in
+    # this initial snapshot and must not be mistaken for an old backlog item.
     initial_entries, last_sha = fetch_file()
-    handled = {entry_key(entry) for entry in initial_entries}
+    handled = {
+        entry_key(entry)
+        for entry in initial_entries
+        if not (
+            SESSION_ID
+            and entry.get("session_id") == SESSION_ID
+            and "response" not in entry
+        )
+    }
+    initial_pending = len(initial_entries) - len(handled)
     print(
         f"[startup] branch={BRANCH} chunks_sha={last_sha[:10]} "
-        f"ignoring {len(handled)} pre-existing chunks",
+        f"ignoring {len(handled)} pre-existing chunks; "
+        f"retaining {initial_pending} from session {SESSION_ID or '<manual>'}",
         flush=True,
     )
 
     announce_ready()
 
     last_change_time = None
-    pending_entries = None
+    pending_entries = initial_entries if initial_pending else None
+    if initial_pending:
+        last_change_time = time.time()
     last_heartbeat = time.time()
 
     while True:

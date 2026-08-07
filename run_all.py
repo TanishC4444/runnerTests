@@ -1,20 +1,23 @@
 """
 Run this one script. It:
-  1. Resets the "ready" status from any previous session.
-  2. Triggers the GitHub Actions workflow (Qwen watcher, cloud side).
-  3. Waits for Qwen to actually announce it's ready (a real warmed-up
-     call, not just "the process started"), and plays that verbal cue
-     through your speakers.
-  4. Only then starts the local mic listener as a subprocess.
-  5. Sits idle — if you haven't made a sound, nothing happens on either
-     side, both just wait.
-  6. The moment you speak and pause, the listener writes + pushes a
-     chunk, the cloud watcher picks it up, and eventually writes the
-     response + audio back into chunks.json.
-  7. Ctrl+C here cancels the cloud run AND kills the local listener.
+  1. Starts the local mic listener (live_split_on_pauses.py) immediately --
+     no waiting on the cloud. Groq (Qwen 3.6 27B) is the primary brain now and
+     answers in-process on that side; the GitHub Actions Qwen watcher is
+     backup only, and live_split_on_pauses.py triggers it itself, lazily,
+     the first time Groq comes back rate-limited.
+  2. Sits idle — if you haven't made a sound, nothing happens.
+  3. The moment you speak and pause, the listener answers (via Groq, or
+     via the Qwen backup if Groq is down) and writes text + response into
+     chunks.json in one push.
+  4. This script's response watcher just plays back whatever "response"
+     shows up in chunks.json, same as before -- it doesn't care which
+     brain produced it.
+  5. Ctrl+C here kills the local listener and cancels the Qwen run only
+     if the fallback ever actually triggered one.
 
 Setup:
-    export GH_TOKEN="your_new_token"   # repo + workflow scope
+    export GH_TOKEN="your_new_token"     # repo + workflow scope
+    export GROQ_API_KEY="your_groq_key"  # primary responder, read by live_split_on_pauses.py
 """
 
 from __future__ import annotations
@@ -482,29 +485,28 @@ def main():
         pass
     start_dashboard_server()
 
-    reset_status()
-    trigger_workflow()
-
-    run_id = None
-    for _ in range(10):
-        time.sleep(2)
-        run_id = get_latest_run_id()
-        if run_id:
-            break
-
-    if not run_id:
-        sys.exit("[cloud] could not find the triggered run.")
-    print(f"[cloud] run id {run_id} is live.")
-
+    # Reset any stale "ready" flag from a previous session so that if the
+    # Qwen fallback does get triggered later, wait_for_ready-style checks
+    # elsewhere don't mistake an old signal for a fresh one. Best-effort --
+    # a failure here shouldn't block starting the mic.
     try:
-        wait_for_ready()
-    except RuntimeError as e:
-        print(f"[cloud] startup failed: {e}")
-        cancel_run(run_id)
-        return
+        reset_status()
+    except Exception as e:
+        print(f"[cloud] could not reset status.json (continuing anyway): {e}")
 
+    # Tag every chunk and any lazily-dispatched backup run with the same
+    # session ID. This lets a newly booted watcher distinguish the unanswered
+    # chunk that launched it from stale, pre-existing conversation history.
+    session_id = str(time.time_ns())
+    _write_local_status(session_id=session_id)
+
+    # No pre-trigger, no wait-for-ready: Groq answers directly, so the mic
+    # starts immediately. live_split_on_pauses.py triggers qwen_watcher.yml
+    # itself, only if/when Groq actually fails.
     print("[local] starting mic listener...")
-    listener = subprocess.Popen([sys.executable, LISTENER_SCRIPT])
+    listener_env = os.environ.copy()
+    listener_env["RUNNER_SESSION_ID"] = session_id
+    listener = subprocess.Popen([sys.executable, LISTENER_SCRIPT], env=listener_env)
 
     stop_event = threading.Event()
     responder = threading.Thread(target=response_watcher_loop, args=(stop_event,), daemon=True)
@@ -530,7 +532,17 @@ def main():
             except subprocess.TimeoutExpired:
                 listener.kill()
         print("[local] listener stopped.")
-        cancel_run(run_id)
+
+        # Only cancel a watcher that this session actually used. Looking up
+        # and cancelling the latest workflow unconditionally can stop an
+        # unrelated/manual backup run when Groq never failed here.
+        if _read_local_status().get("qwen_fallback_triggered"):
+            try:
+                run_id = get_latest_run_id()
+                if run_id:
+                    cancel_run(run_id)
+            except Exception as e:
+                print(f"[cloud] could not check/cancel Qwen run: {e}")
 
 
 if __name__ == "__main__":
