@@ -26,6 +26,8 @@ Stops only when the job is cancelled (by you, via the cancel-run API) or
 the workflow's own timeout is hit.
 """
 
+from __future__ import annotations
+
 import base64
 import json
 import os
@@ -39,10 +41,7 @@ import requests
 
 # GitHub Actions doesn't attach a TTY to step output, so Python buffers
 # stdout by default -- prints can sit invisible for a long time instead
-# of showing up as they happen. Force line buffering so the log is live,
-# which also matters now: run_all.py polls this exact log stream for
-# RESULT:: lines (see below), so buffered/delayed output directly adds
-# to response latency, not just log readability.
+# of showing up as they happen. Force line buffering so the log is live.
 sys.stdout.reconfigure(line_buffering=True)
 
 CPU_COUNT = os.cpu_count() or 4
@@ -206,22 +205,6 @@ def push_response(key: tuple, reply: str):
             )
 
     raise RuntimeError("could not save response after repeated chunk-file conflicts")
-
-
-def push_response_async(key: tuple, reply: str):
-    """Runs on a background thread. The RESULT:: log line (see main loop)
-    already told run_all.py the answer -- this call is now purely for the
-    durable written record in chunks.json, so it no longer needs to sit on
-    the critical path between "reply generated" and "you hear it"."""
-    def _worker():
-        t0 = time.time()
-        try:
-            push_response(key, reply)
-            print(f"  [async] response committed to chunks.json in {time.time()-t0:.2f}s", flush=True)
-        except Exception as e:
-            print(f"  [async] failed to save response (log line still stands): {e}", flush=True)
-
-    threading.Thread(target=_worker, daemon=True).start()
 
 
 _MARKDOWN_STRIP_RE = re.compile(r"[*_`#]+|^\s*[-•]\s+", re.MULTILINE)
@@ -436,16 +419,15 @@ def main():
                     handled.add(key)
                     continue
 
-                # This is the line run_all.py's log poller looks for -- the
-                # reply reaches you as soon as this print flushes, not after
-                # a full git-commit round trip. entry_key's datetime field
-                # alone is enough to match it back to the right chunk locally.
-                result_line = json.dumps({"datetime": entry.get("datetime"), "text": reply})
-                print(f"RESULT::{result_line}", flush=True)
-                print(f"  [timing] total_before_git={time.time()-t_start:.2f}s (git push now async)", flush=True)
-
-                push_response_async(key, reply)
-                handled.add(key)
+                try:
+                    t0 = time.time()
+                    push_response(key, reply)
+                    print(f"  [timing] git push={time.time()-t0:.2f}s "
+                          f"total={time.time()-t_start:.2f}s", flush=True)
+                except Exception as e:
+                    print(f"  failed to save response: {e}", flush=True)
+                finally:
+                    handled.add(key)
 
             # Refresh after the batch. A new chunk may have landed while Qwen
             # was generating; keep it pending instead of accidentally treating
