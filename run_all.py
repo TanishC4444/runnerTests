@@ -367,12 +367,19 @@ def response_watcher_loop(stop_event: threading.Event):
                 conv_state="speaking", conv_state_ts=time.time(), last_reply_text=reply
             )
 
-            audio_b64 = entry.get("response_audio_b64")
-            if audio_b64:
-                tmp_path = os.path.join(tempfile.gettempdir(), "qwen_reply.mp3")
-                with open(tmp_path, "wb") as f:
-                    f.write(base64.b64decode(audio_b64))
-                play_audio_interruptible(tmp_path, session_start_ts=time.time())
+            # New format: a path to a small file that git pull already put
+            # on disk locally -- read it directly, no base64 decode needed.
+            audio_path = entry.get("response_audio_path")
+            if audio_path and os.path.exists(audio_path):
+                play_audio_interruptible(audio_path, session_start_ts=time.time())
+            else:
+                # Back-compat with older entries saved before this change.
+                audio_b64 = entry.get("response_audio_b64")
+                if audio_b64:
+                    tmp_path = os.path.join(tempfile.gettempdir(), "qwen_reply.mp3")
+                    with open(tmp_path, "wb") as f:
+                        f.write(base64.b64decode(audio_b64))
+                    play_audio_interruptible(tmp_path, session_start_ts=time.time())
 
             _write_local_status(conv_state="idle", conv_state_ts=time.time())
 

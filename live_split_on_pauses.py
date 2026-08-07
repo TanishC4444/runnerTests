@@ -86,7 +86,9 @@ FRAME_MS = 30                     # webrtcvad requires 10/20/30ms frames
 FRAME_BYTES = int(SAMPLE_RATE * FRAME_MS / 1000) * 2  # 16-bit samples
 PAUSE_MS = 600                     # how much silence = "you paused"
 PAUSE_FRAMES = PAUSE_MS // FRAME_MS
-VAD_AGGRESSIVENESS = 2             # 0 (lenient) - 3 (strict about what counts as speech)
+VAD_AGGRESSIVENESS = 3             # 0 (lenient) - 3 (strict about what counts as speech)
+BARGE_IN_CONFIRM_FRAMES = 5        # ~150ms of sustained speech before we call it a real barge-in
+                                    # (was 1 frame / 30ms -- that's why a cough or click triggered it)
 SHOW_PARTIAL_PREVIEW = True        # set False if your terminal/log doesn't handle \r
 
 LOG_DIR = os.path.join("chat", "Log 1")
@@ -289,6 +291,10 @@ def live_split():
     in_speech = False
     speech_run = 0       # frames flagged as actual speech, i.e. talk time
     last_partial = ""
+    barge_in_confirm_run = 0   # consecutive speech frames -- separate from
+                               # speech_run so debouncing barge-in never
+                               # affects chunk-boundary timing/accuracy
+    barge_in_signaled = False
 
     try:
         while True:
@@ -303,6 +309,8 @@ def live_split():
                 silence_run = 0
                 speech_run = 0
                 last_partial = ""
+                barge_in_confirm_run = 0
+                barge_in_signaled = False
                 continue
 
             is_speech = vad.is_speech(frame, SAMPLE_RATE)
@@ -310,16 +318,16 @@ def live_split():
             rec.AcceptWaveform(frame)  # feed regardless, keeps partials live
 
             if is_speech:
-                was_in_speech = in_speech
                 in_speech = True
                 silence_run = 0
                 speech_run += 1
 
-                if not was_in_speech:
-                    # Onset of speech -- the one moment run_all.py's playback
-                    # watcher actually needs to know about, so it can cut
-                    # Jarvis off immediately (barge-in). Written once per
-                    # utterance, not per-frame.
+                # Debounced separately from chunk-boundary tracking above --
+                # a single noisy frame (cough, click, chair creak) no longer
+                # fires barge-in. Needs BARGE_IN_CONFIRM_FRAMES in a row.
+                barge_in_confirm_run += 1
+                if not barge_in_signaled and barge_in_confirm_run >= BARGE_IN_CONFIRM_FRAMES:
+                    barge_in_signaled = True
                     _write_local_status(mic_state="speech", mic_state_ts=time.time())
 
                 if SHOW_PARTIAL_PREVIEW:
@@ -331,6 +339,8 @@ def live_split():
 
             elif in_speech:
                 silence_run += 1
+                barge_in_confirm_run = 0
+                barge_in_signaled = False
 
             should_finalize = in_speech and (not is_speech) and silence_run >= PAUSE_FRAMES
 
@@ -347,6 +357,8 @@ def live_split():
                 silence_run = 0
                 speech_run = 0
                 last_partial = ""
+                barge_in_confirm_run = 0
+                barge_in_signaled = False
                 _write_local_status(mic_state="listening", mic_state_ts=time.time())
 
                 if raw_text:

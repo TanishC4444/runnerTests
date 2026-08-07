@@ -41,14 +41,16 @@ sys.stdout.reconfigure(line_buffering=True)
 print(f"[deps] requests {requests.__version__}, edge_tts import OK", flush=True)
 
 # Jarvis-ish: calm, deep, British male voice. Full voice list: `edge-tts --list-voices`.
-# Other reasonable picks: "en-GB-ThomasNeural" (younger/brisker), "en-US-GuyNeural" (American).
-TTS_VOICE = "en-GB-RyanNeural"
-TTS_RATE = "+18%"   # you asked for faster-than-default speech; tune this to taste
+# Other reasonable picks: "en-GB-ThomasNeural" (younger/brisker, more clipped RP),
+# "en-GB-RyanNeural" (previous default, deeper/slower delivery).
+TTS_VOICE = "en-GB-ThomasNeural"
+TTS_RATE = "+32%"   # bumped further; drop back toward +18% if it starts sounding rushed/clipped
 
 TOKEN = os.environ["GH_TOKEN"]
 REPO = os.environ["GITHUB_REPOSITORY"]  # "owner/repo"
 FILE_PATH = "chat/Log 1/chunks.json"
 STATUS_FILE = "chat/Log 1/status.json"
+AUDIO_DIR = "chat/Log 1/audio"  # one small file per response, NOT embedded in chunks.json
 API_URL = f"https://api.github.com/repos/{REPO}/contents/{FILE_PATH}"
 STATUS_API_URL = f"https://api.github.com/repos/{REPO}/contents/{STATUS_FILE}"
 
@@ -163,7 +165,40 @@ def entry_key(entry: dict) -> tuple:
     )
 
 
-def push_response(key: tuple, reply: str, audio_b64: str | None):
+def entry_id(key: tuple) -> str:
+    """Filesystem-safe id derived from entry_key, used as the audio filename."""
+    import hashlib
+    return hashlib.sha1("|".join(str(k) for k in key).encode("utf-8")).hexdigest()[:16]
+
+
+def push_audio_file(filename: str, audio_bytes: bytes) -> str:
+    """Uploads ONE small audio file (not the whole chunks.json array).
+
+    This is the fix for chunks.json growing unbounded: previously every
+    response embedded its full base64 mp3 INSIDE the shared entries array,
+    so every subsequent push (new chunk OR new response) re-serialized and
+    re-uploaded the ENTIRE conversation's audio history every single time --
+    strictly growing payload size per exchange. Each response's audio now
+    gets its own tiny file; chunks.json only ever stores a path string.
+    Returns the relative path stored in the entry.
+    """
+    path = f"{AUDIO_DIR}/{filename}"
+    url = f"https://api.github.com/repos/{REPO}/contents/{path}"
+    resp = requests.put(
+        url,
+        headers=gh_headers(),
+        json={
+            "message": "Add response audio",
+            "content": base64.b64encode(audio_bytes).decode("utf-8"),
+            "branch": BRANCH,
+        },
+        timeout=GITHUB_TIMEOUT_S,
+    )
+    resp.raise_for_status()
+    return path
+
+
+def push_response(key: tuple, reply: str, audio_path: str | None):
     """Merge one response into the newest file and push it immediately.
 
     The microphone can add another chunk while Qwen is generating. Re-fetching
@@ -179,8 +214,10 @@ def push_response(key: tuple, reply: str, audio_b64: str | None):
             return
 
         target["response"] = reply
-        if audio_b64:
-            target["response_audio_b64"] = audio_b64
+        if audio_path:
+            # path only -- the actual bytes already live in their own small
+            # file (see push_audio_file), not embedded here.
+            target["response_audio_path"] = audio_path
 
         try:
             push_file(entries, sha, "Add Qwen response + TTS audio")
@@ -224,13 +261,13 @@ async def _edge_tts_save(text: str, path: str) -> None:
     await communicate.save(path)
 
 
-def tts_base64(text: str, lang: str = "en") -> str:
+def tts_bytes(text: str, lang: str = "en") -> bytes:
     """lang kept in the signature so call sites don't need to change;
     voice/rate/accent are controlled by TTS_VOICE/TTS_RATE above instead."""
     tmp_path = f"/tmp/reply_{lang}.mp3"
     asyncio.run(_edge_tts_save(text, tmp_path))
     with open(tmp_path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
+        return f.read()
 
 
 def fetch_status():
@@ -302,7 +339,7 @@ def announce_ready():
     print(f"[ready] warm-up call answered in {time.time() - t0:.1f}s", flush=True)
 
     try:
-        audio_b64 = tts_base64("I'm ready, go ahead.", lang="en")
+        audio_b64 = base64.b64encode(tts_bytes("I'm ready, go ahead.", lang="en")).decode("utf-8")
         print("[ready] TTS generated.", flush=True)
     except Exception as e:
         # Speech is optional; a TTS outage should not disguise a healthy
@@ -409,14 +446,17 @@ def main():
                     handled.add(key)
                     continue
 
+                audio_path = None
                 try:
-                    audio_b64 = tts_base64(reply, lang="en")
+                    audio_bytes = tts_bytes(reply, lang="en")
+                    filename = f"{entry_id(key)}.mp3"
+                    audio_path = push_audio_file(filename, audio_bytes)
+                    print(f"  audio pushed separately: {audio_path}", flush=True)
                 except Exception as e:
-                    print(f"  TTS failed; saving text response only: {e}", flush=True)
-                    audio_b64 = None
+                    print(f"  TTS/audio push failed; saving text response only: {e}", flush=True)
 
                 try:
-                    push_response(key, reply, audio_b64)
+                    push_response(key, reply, audio_path)
                     print("  response pushed", flush=True)
                 except Exception as e:
                     print(f"  failed to save response: {e}", flush=True)
