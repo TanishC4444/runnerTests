@@ -122,5 +122,13 @@
     "raw_text": "oh you wait no actually i want to know what cubits or in quantum computing",
     "session_id": "1786125856239933000",
     "response": "I think there might be a bit of a mix-up there. A cubit is an ancient unit of length, roughly the distance from your elbow to the tip of your middle finger. It has nothing to do with quantum computing.\n\nIn quantum computing, the basic unit of information is called a qubit, short for quantum bit. Unlike a regular bit which is either a zero or a one, a qubit can exist in a state of superposition, meaning it can represent both zero and one at the same time until it is measured. This allows quantum computers to process vast amounts of possibilities simultaneously."
+  },
+  {
+    "datetime": "2026-08-07T13:06:04.758288",
+    "talk_seconds": 3.06,
+    "text": "oh, tell me about tell me about good it's in quantum computer",
+    "raw_text": "oh tell me about tell me about good it's in quantum computer",
+    "session_id": "1786125856239933000",
+    "response": "I believe you are asking about qubits, which are the fundamental building blocks of quantum computers. A qubit, short for quantum bit, is the quantum equivalent of the classical bit used in traditional computers. While a classical bit can only be in one of two states, either zero or one, a qubit can exist in a state of superposition. This means it can represent both zero and one simultaneously. This unique property allows quantum computers to perform many calculations at once, potentially solving certain complex problems much faster than classical computers. Qubits can be made from various physical systems, such as trapped ions, superconducting circuits, or photons."
   }
 ]
