@@ -61,5 +61,11 @@
     "text": "I'm not sure i on that",
     "raw_text": "i'm not sure i on that",
     "response": "I'm not sure I am on that."
+  },
+  {
+    "datetime": "2026-08-07T12:33:00.876909",
+    "talk_seconds": 1.65,
+    "text": "Hey man how you're doing",
+    "raw_text": "hey man how you doing"
   }
 ]
