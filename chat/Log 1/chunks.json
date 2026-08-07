@@ -162,5 +162,13 @@
     "raw_text": "no i tablet came to me the most recent war it in your database",
     "session_id": "1786125856239933000",
     "response": "I do not have a single, fixed database with a specific cutoff date that I can share with you. My knowledge is based on a vast amount of information available up to a certain point in time, but I do not track real-time events or have a live feed of current news. Therefore, I cannot tell you the absolute most recent war that has just started or ended today. I can only discuss conflicts that were widely reported and documented before my training data was finalized. For the very latest information on ongoing conflicts, I recommend checking a reliable news source."
+  },
+  {
+    "datetime": "2026-08-07T13:07:02.690538",
+    "talk_seconds": 2.73,
+    "text": "What is your cut-off date than for your modeling data",
+    "raw_text": "what is your cut off date than for your modeling data",
+    "session_id": "1786125856239933000",
+    "response": "My training data includes information up to early 2024. This means I can answer questions about events, facts, and developments that occurred before that time. However, I do not have real-time access to current news or events that have happened after my training cutoff. For the most up-to-date information, especially regarding ongoing conflicts or recent developments, I recommend checking a reliable news source."
   }
 ]
