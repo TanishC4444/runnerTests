@@ -30,5 +30,11 @@
     "raw_text": "hey man how are you",
     "response": "I'm doing well! How can I assist you today?",
     "response_audio_path": "chat/Log 1/audio/1b7613fe7fce8fb5.mp3"
+  },
+  {
+    "datetime": "2026-08-06T20:13:46.079128",
+    "talk_seconds": 3.36,
+    "text": "What are your capabilities and like you know what's up with you",
+    "raw_text": "what are your capabilities and like you know what's up with you"
   }
 ]
