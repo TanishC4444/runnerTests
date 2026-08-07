@@ -68,5 +68,11 @@
     "text": "Hey man how you're doing",
     "raw_text": "hey man how you doing",
     "response": "Hey man, how are you doing?"
+  },
+  {
+    "datetime": "2026-08-07T12:33:21.596247",
+    "talk_seconds": 1.56,
+    "text": "I'm doing good how are you",
+    "raw_text": "i'm doing good how are you"
   }
 ]
