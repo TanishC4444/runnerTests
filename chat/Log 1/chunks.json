@@ -82,5 +82,13 @@
     "text": "If that's enough think you meant goodbye",
     "raw_text": "i that's enough think you meant goodbye",
     "response": "If that's enough, I'm thinking you meant goodbye."
+  },
+  {
+    "datetime": "2026-08-07T12:58:34.093976",
+    "talk_seconds": 1.26,
+    "text": "Hello how are you",
+    "raw_text": "hello how are you",
+    "session_id": "1786125503269574000",
+    "response": "Hello! I am doing well, thank you for asking. How are you doing today?"
   }
 ]
