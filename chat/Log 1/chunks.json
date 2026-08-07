@@ -5,5 +5,11 @@
     "text": "How are you doing",
     "raw_text": "how are you did",
     "response": "I'm doing well, thank you for asking. How are you?"
+  },
+  {
+    "datetime": "2026-08-07T01:55:56.720539",
+    "talk_seconds": 4.08,
+    "text": "I'm quite fine and can you explain me cubits from quantum mechanics",
+    "raw_text": "i'm quite fine and can you explain me cubits from quantum mechanics"
   }
 ]
