@@ -578,5 +578,13 @@
     "raw_text": "trip",
     "session_id": "1786154565008731000",
     "response": "Routing failed: Groq planner failed with HTTP 429: {\"error\":{\"message\":\"Rate limit reached for model `qwen/qwen3.6-27b` in organization `org_01kbs1pwysfrev2qgn9w3ywasd` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Used 6466, Requested 3576. Please try again in 15.314999999s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing\",\"type\":\"tokens\",\"code\":\"rate_limit_exceeded\"}}"
+  },
+  {
+    "datetime": "2026-08-07T21:03:19.412717",
+    "talk_seconds": 3.27,
+    "text": "Try repository runners test no space",
+    "raw_text": "try repository runners test no space",
+    "session_id": "1786154565008731000",
+    "response": "Routing failed: Groq planner failed with HTTP 429: {\"error\":{\"message\":\"Rate limit reached for model `qwen/qwen3.6-27b` in organization `org_01kbs1pwysfrev2qgn9w3ywasd` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Used 6025, Requested 2271. Please try again in 2.219999999s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing\",\"type\":\"tokens\",\"code\":\"rate_limit_exceeded\"}}"
   }
 ]
