@@ -483,6 +483,24 @@ class _DashboardHandler(http.server.BaseHTTPRequestHandler):
             if parsed.path.startswith("/api/skills/") and parsed.path.endswith("/toggle"):
                 name = parsed.path.split("/")[3]
                 return self._send_json(self.control_plane.set_skill_enabled(name, bool(payload.get("enabled"))))
+            if parsed.path == "/api/skills":
+                return self._send_json(self.control_plane.save_skill(payload), 201)
+            if parsed.path.startswith("/api/skills/") and parsed.path.endswith("/save"):
+                name = parsed.path.split("/")[3]
+                return self._send_json(self.control_plane.save_skill(payload, original_name=name))
+            if parsed.path.startswith("/api/skills/") and parsed.path.endswith("/delete"):
+                name = parsed.path.split("/")[3]
+                self.control_plane.delete_skill(name)
+                return self._send_json({"status": "deleted"})
+            if parsed.path == "/api/mcp":
+                return self._send_json(self.control_plane.save_mcp_server(payload.get("name", ""), payload), 201)
+            if parsed.path.startswith("/api/mcp/") and parsed.path.endswith("/save"):
+                name = parsed.path.split("/")[3]
+                return self._send_json(self.control_plane.save_mcp_server(payload.get("name") or name, payload, original_name=name))
+            if parsed.path.startswith("/api/mcp/") and parsed.path.endswith("/delete"):
+                name = parsed.path.split("/")[3]
+                self.control_plane.delete_mcp_server(name)
+                return self._send_json({"status": "deleted"})
             return self._send_json({"error": "Unknown endpoint"}, 404)
         except (ControlPlaneError, requests.RequestException, ValueError, KeyError) as e:
             return self._send_json({"error": str(e)}, 400)

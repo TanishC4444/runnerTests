@@ -141,7 +141,7 @@ SAMPLE_RATE = 16000
 
 FRAME_MS = 30                     # webrtcvad requires 10/20/30ms frames
 FRAME_BYTES = int(SAMPLE_RATE * FRAME_MS / 1000) * 2  # 16-bit samples
-PAUSE_MS = 600                     # how much silence = "you paused"
+PAUSE_MS = 420                     # how much silence = "you paused" (was 600; trimmed for snappier turn-taking)
 PAUSE_FRAMES = PAUSE_MS // FRAME_MS
 VAD_AGGRESSIVENESS = 3             # 0 (lenient) - 3 (strict about what counts as speech)
 BARGE_IN_CONFIRM_FRAMES = 5        # ~150ms of sustained speech before we call it a real barge-in

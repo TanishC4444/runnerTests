@@ -5,7 +5,7 @@
   "triggers": ["create", "implement", "fix", "refactor", "debug", "build", "script", "folder", "change"],
   "mode": "delegate",
   "model": "qwen/qwen3.6-27b",
-  "allowed_tools": ["delegate_to_gptoss"],
+  "allowed_tools": ["delegate_to_gptoss", "github_create_folder", "github_put_file"],
   "required_context": ["repository", "objective", "success criteria"],
   "instructions": "Before delegation, ask only questions whose answers materially change the implementation. Ask at most three concise questions at once. Prefer repository reads over asking discoverable questions. When enough context exists, create ordered steps and measurable acceptance criteria for GPT-OSS 20B."
 }

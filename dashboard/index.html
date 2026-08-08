@@ -15,7 +15,7 @@
       <nav id="session-list" class="sessions"></nav>
       <div class="rail-bottom">
         <div class="connection-row"><span id="github-dot" class="dot"></span><span id="github-label">GitHub disconnected</span></div>
-        <button id="open-settings" class="text-button">Connections & routing</button>
+        <button id="open-settings" class="text-button">Connections &amp; routing</button>
       </div>
     </aside>
 
@@ -28,7 +28,7 @@
         <div class="status-cluster">
           <div class="model-chip"><span class="pulse green"></span><div><small>ROUTER</small><strong>Qwen 3.6 27B</strong></div></div>
           <div class="model-chip"><span id="worker-pulse" class="pulse blue"></span><div><small>ACTIONS WORKER</small><strong>GPT-OSS 20B</strong></div></div>
-          <button id="ops-toggle" class="icon-button" aria-label="Toggle operations panel">Operations</button>
+          <button id="ops-toggle" class="icon-button" aria-label="Toggle operations panel">Operations<span id="ops-badge" class="mini-count hidden">0</span></button>
         </div>
       </header>
 
@@ -50,42 +50,53 @@
           <textarea id="command-input" rows="1" placeholder="Tell the agent what to do…" aria-label="Command"></textarea>
           <button type="submit" id="send-button">Send</button>
         </form>
-        <div class="safety-note"><span>Shielded</span> Writes require approval · destructive tools unavailable</div>
+        <div class="safety-note"><span>Shielded</span> Writes require approval · destructive tools are always blocked</div>
       </section>
     </main>
 
     <aside id="ops-panel" class="ops-panel open">
-      <div class="ops-head"><div><div class="eyebrow">LIVE SYSTEM</div><h2>Operations</h2></div><button id="close-ops" class="close-button">×</button></div>
+      <div class="ops-head">
+        <div><div class="eyebrow">LIVE SYSTEM</div><h2>Operations</h2></div>
+        <button id="close-ops" class="close-button">×</button>
+      </div>
 
-      <section class="panel-section">
-        <div class="section-title"><span>Approvals</span><span id="approval-count" class="count">0</span></div>
+      <nav class="ops-tabs" id="ops-tabs">
+        <button class="ops-tab active" data-tab="approvals">Approvals<span id="approval-count" class="count hidden">0</span></button>
+        <button class="ops-tab" data-tab="github">GitHub</button>
+        <button class="ops-tab" data-tab="usage">Usage</button>
+        <button class="ops-tab" data-tab="mcp">MCPs</button>
+        <button class="ops-tab" data-tab="skills">Skills</button>
+      </nav>
+
+      <section class="panel-section ops-view" data-view="approvals">
+        <div class="section-title"><span>Pending approvals</span></div>
         <div id="approval-list" class="stack"><div class="muted-card">No actions waiting</div></div>
       </section>
 
-      <section class="panel-section">
+      <section class="panel-section ops-view hidden" data-view="github">
         <div class="section-title"><span>GitHub activity</span><button id="refresh-github" class="mini-button">Refresh</button></div>
         <div id="github-overview" class="stack"><div class="muted-card">Connect GitHub to inspect repositories and runners.</div></div>
       </section>
 
-      <section class="panel-section">
-        <div class="section-title"><span>Usage</span><span class="live-label">SESSION</span></div>
+      <section class="panel-section ops-view hidden" data-view="usage">
+        <div class="section-title"><span>Token usage</span><span class="live-label">SESSION</span></div>
         <div id="usage-list" class="usage-list"></div>
       </section>
 
-      <section class="panel-section">
-        <div class="section-title"><span>MCP servers</span></div>
+      <section class="panel-section ops-view hidden" data-view="mcp">
+        <div class="section-title"><span>MCP servers</span><button id="add-mcp" class="mini-button">+ Add server</button></div>
         <div id="mcp-list" class="stack"></div>
       </section>
 
-      <section class="panel-section">
-        <div class="section-title"><span>Skills & routing</span></div>
+      <section class="panel-section ops-view hidden" data-view="skills">
+        <div class="section-title"><span>Skills &amp; routing</span><button id="add-skill" class="mini-button">+ Add skill</button></div>
         <div id="skill-list" class="stack"></div>
       </section>
     </aside>
   </div>
 
   <dialog id="settings-dialog">
-    <form method="dialog" class="dialog-head"><div><div class="eyebrow">CONNECTIONS</div><h2>GitHub & model access</h2></div><button class="close-button">×</button></form>
+    <form method="dialog" class="dialog-head"><div><div class="eyebrow">CONNECTIONS</div><h2>GitHub &amp; model access</h2></div><button class="close-button">×</button></form>
     <div class="dialog-body">
       <div class="settings-card">
         <div><strong>GitHub OAuth</strong><p>Tokens stay in memory and are never shown in the dashboard or logs.</p></div>
@@ -99,6 +110,61 @@
         <div class="key-grid"><span>Groq API</span><span id="groq-key-status" class="badge">Unknown</span><span>GitHub</span><span id="github-key-status" class="badge">Unknown</span></div>
       </div>
     </div>
+  </dialog>
+
+  <dialog id="skill-dialog">
+    <form method="dialog" class="dialog-head"><div><div class="eyebrow" id="skill-dialog-eyebrow">SKILL</div><h2 id="skill-dialog-title">New skill</h2></div><button class="close-button">×</button></form>
+    <form id="skill-form" class="dialog-body">
+      <label>Name (lowercase, underscores)<input id="skill-name" required pattern="[a-z0-9_]+" placeholder="repository_bootstrap"></label>
+      <label>Title<input id="skill-title" required placeholder="Repository bootstrap"></label>
+      <div class="field-row">
+        <label>Mode
+          <select id="skill-mode">
+            <option value="chat">chat</option>
+            <option value="read">read</option>
+            <option value="write">write</option>
+            <option value="delegate">delegate</option>
+          </select>
+        </label>
+        <label>Model<input id="skill-model" placeholder="qwen/qwen3.6-27b"></label>
+      </div>
+      <label>Trigger words (comma separated, empty = always active)<input id="skill-triggers" placeholder="create, deploy, repo"></label>
+      <label>Allowed tools (comma separated, supports trailing * wildcard)<input id="skill-tools" placeholder="github_get_file, mcp__github__*"></label>
+      <label>Required context (comma separated, optional)<input id="skill-required" placeholder="repository, objective"></label>
+      <label>Instructions<textarea id="skill-instructions" rows="4" placeholder="How this skill should behave…"></textarea></label>
+      <div class="dialog-actions">
+        <button type="button" id="skill-delete" class="danger-button hidden">Delete skill</button>
+        <div class="spacer"></div>
+        <button type="button" id="skill-cancel" class="ghost-button">Cancel</button>
+        <button type="submit" id="skill-save" class="primary-button">Save skill</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="mcp-dialog">
+    <form method="dialog" class="dialog-head"><div><div class="eyebrow">MCP SERVER</div><h2 id="mcp-dialog-title">New MCP server</h2></div><button class="close-button">×</button></form>
+    <form id="mcp-form" class="dialog-body">
+      <label>Name (lowercase, underscores)<input id="mcp-name" required pattern="[a-z0-9_]+" placeholder="linear"></label>
+      <label>Streamable HTTP URL<input id="mcp-url" required placeholder="https://mcp.example.com/"></label>
+      <div class="field-row">
+        <label>Auth
+          <select id="mcp-auth">
+            <option value="">None</option>
+            <option value="github_oauth">GitHub OAuth (this app's token)</option>
+            <option value="static_token">Bearer token from env var</option>
+          </select>
+        </label>
+        <label id="mcp-token-env-wrap" class="hidden">Env var with the token<input id="mcp-token-env" placeholder="LINEAR_MCP_TOKEN"></label>
+      </div>
+      <label class="checkbox-row"><input type="checkbox" id="mcp-readonly"> Treat every tool on this server as read-only (skips approval)</label>
+      <label>Toolsets (comma separated, informational)<input id="mcp-toolsets" placeholder="issues, projects"></label>
+      <div class="dialog-actions">
+        <button type="button" id="mcp-delete" class="danger-button hidden">Remove server</button>
+        <div class="spacer"></div>
+        <button type="button" id="mcp-cancel" class="ghost-button">Cancel</button>
+        <button type="submit" id="mcp-save" class="primary-button">Save server</button>
+      </div>
+    </form>
   </dialog>
 
   <div id="toast" class="toast"></div>

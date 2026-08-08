@@ -261,6 +261,9 @@ class GitHubTools:
         }
         return [
             ToolSpec("github_list_repositories", "List repositories available to the authenticated user.", {"type": "object", "properties": {}, "additionalProperties": False}),
+            ToolSpec("github_get_repository", "Get basic info about one repository: description, language, stars, forks, open issues, default branch, license, and topics.", {"type": "object", "properties": repo_target, "required": ["owner", "repo"], "additionalProperties": False}),
+            ToolSpec("github_list_repo_files", "List the files and folders at a path inside a repository (non-recursive, one directory level).", {"type": "object", "properties": {**repo_target, "path": {"type": "string", "description": "Directory path; empty string for the repository root"}, "ref": {"type": "string", "description": "Branch, tag, or commit SHA; defaults to the default branch"}}, "required": ["owner", "repo"], "additionalProperties": False}),
+            ToolSpec("github_get_file", "Read the text contents of one file in a repository.", {"type": "object", "properties": {**repo_target, "path": {"type": "string"}, "ref": {"type": "string", "description": "Branch, tag, or commit SHA; defaults to the default branch"}}, "required": ["owner", "repo", "path"], "additionalProperties": False}),
             ToolSpec("github_list_workflow_runs", "List recent GitHub Actions workflow runs for a repository.", {"type": "object", "properties": repo_target, "required": ["owner", "repo"], "additionalProperties": False}),
             ToolSpec("github_list_runners", "List self-hosted runners configured for a repository.", {"type": "object", "properties": repo_target, "required": ["owner", "repo"], "additionalProperties": False}),
             ToolSpec("github_dispatch_agent", "Dispatch an approved GPT-OSS 20B task to a GitHub-hosted Actions runner. It works in the background and may open a reviewable pull request.", {"type": "object", "properties": {**repo_target, "task": {"type": "string"}, "session_id": {"type": "string"}, "ref": {"type": "string"}}, "required": ["owner", "repo", "task"], "additionalProperties": False}, True),
@@ -317,6 +320,43 @@ class GitHubTools:
         if name == "github_list_repositories":
             rows = self._request("GET", "/user/repos?per_page=50&sort=updated")
             return [{"full_name": r["full_name"], "private": r["private"], "updated_at": r["updated_at"], "default_branch": r["default_branch"]} for r in rows]
+        if name == "github_get_repository":
+            owner, repo = arguments["owner"], arguments["repo"]
+            self._validate_repo(owner, repo)
+            r = self._request("GET", f"/repos/{quote(owner)}/{quote(repo)}")
+            return {
+                "full_name": r.get("full_name"),
+                "description": r.get("description"),
+                "private": r.get("private"),
+                "language": r.get("language"),
+                "default_branch": r.get("default_branch"),
+                "stargazers_count": r.get("stargazers_count"),
+                "forks_count": r.get("forks_count"),
+                "open_issues_count": r.get("open_issues_count"),
+                "license": (r.get("license") or {}).get("spdx_id"),
+                "topics": r.get("topics", []),
+                "html_url": r.get("html_url"),
+                "updated_at": r.get("updated_at"),
+            }
+        if name == "github_list_repo_files":
+            owner, repo = arguments["owner"], arguments["repo"]
+            self._validate_repo(owner, repo)
+            path = (arguments.get("path") or "").strip("/")
+            query = f"?ref={quote(arguments['ref'])}" if arguments.get("ref") else ""
+            result = self._request("GET", f"/repos/{quote(owner)}/{quote(repo)}/contents/{quote(path, safe='/')}{query}")
+            rows = result if isinstance(result, list) else [result]
+            return [{"name": row.get("name"), "path": row.get("path"), "type": row.get("type"), "size": row.get("size")} for row in rows]
+        if name == "github_get_file":
+            owner, repo = arguments["owner"], arguments["repo"]
+            self._validate_repo(owner, repo)
+            path = self._validate_path(arguments["path"])
+            query = f"?ref={quote(arguments['ref'])}" if arguments.get("ref") else ""
+            result = self._request("GET", f"/repos/{quote(owner)}/{quote(repo)}/contents/{quote(path, safe='/')}{query}")
+            if isinstance(result, list) or result.get("type") != "file":
+                raise ControlPlaneError(f"{path!r} is a directory, not a file")
+            content = base64.b64decode(result.get("content", "")).decode("utf-8", errors="replace")
+            truncated = len(content) > 20000
+            return {"path": path, "size": result.get("size"), "truncated": truncated, "content": content[:20000]}
         if name in ("github_list_workflow_runs", "github_list_runners"):
             owner, repo = arguments["owner"], arguments["repo"]
             self._validate_repo(owner, repo)
@@ -420,8 +460,18 @@ class MCPRegistry:
             raise ControlPlaneError(f"MCP server {name!r} is not enabled")
         if cfg.get("transport") != "streamable_http":
             raise ControlPlaneError("Only Streamable HTTP MCP servers are supported by this control plane")
-        token = self.auth.token() if cfg.get("auth") == "github_oauth" else None
-        if cfg.get("auth") and not token:
+        auth_mode = cfg.get("auth")
+        token = None
+        if auth_mode == "github_oauth":
+            token = self.auth.token()
+        elif auth_mode == "static_token":
+            # A bearer token read from an environment variable at request time --
+            # lets you add API-key-based MCP servers (Notion, Linear, a private
+            # server, etc.) from the dashboard without ever putting the secret
+            # itself in config/control_plane.json. Set the env var in .env.
+            env_var = cfg.get("token_env")
+            token = os.environ.get(env_var) if env_var else None
+        if auth_mode and not token:
             raise ControlPlaneError(f"MCP server {name!r} requires an authenticated connection")
         headers = {
             "Accept": "application/json, text/event-stream",
@@ -542,6 +592,45 @@ class SkillRegistry:
         tmp.replace(path)
         return skill
 
+    def save(self, skill: dict, original_name: str | None = None) -> dict:
+        """Create a new skill, or overwrite one in place when `original_name`
+        matches an existing file. Renaming (original_name != new name)
+        removes the old file so there's never a stale duplicate on disk."""
+        name = str(skill.get("name", "")).strip().lower().replace(" ", "_")
+        if not re.fullmatch(r"[a-z0-9_]+", name or ""):
+            raise ControlPlaneError("Skill name must use lowercase letters, numbers, and underscores only")
+        if not str(skill.get("title", "")).strip():
+            raise ControlPlaneError("Skill needs a title")
+        cleaned = {
+            "name": name,
+            "title": skill["title"].strip(),
+            "enabled": bool(skill.get("enabled", True)),
+            "triggers": [str(t).strip() for t in skill.get("triggers", []) if str(t).strip()],
+            "mode": skill.get("mode") or "chat",
+            "model": skill.get("model") or "qwen/qwen3.6-27b",
+            "allowed_tools": [str(t).strip() for t in skill.get("allowed_tools", []) if str(t).strip()],
+            "instructions": str(skill.get("instructions", "")).strip(),
+        }
+        if skill.get("required_context"):
+            cleaned["required_context"] = [str(t).strip() for t in skill["required_context"] if str(t).strip()]
+        path = self.directory / f"{name}.json"
+        if original_name and original_name != name:
+            existing = next((item for item in self.list() if item["name"] == original_name), None)
+            if existing:
+                (self.directory / existing["file"]).unlink(missing_ok=True)
+        elif not original_name and path.exists():
+            raise ControlPlaneError(f"A skill named {name!r} already exists")
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cleaned, indent=2), encoding="utf-8")
+        tmp.replace(path)
+        return {**cleaned, "file": path.name}
+
+    def delete(self, name: str) -> None:
+        skill = next((item for item in self.list() if item["name"] == name), None)
+        if not skill:
+            raise ControlPlaneError("Unknown skill")
+        (self.directory / skill["file"]).unlink()
+
 
 class ModelRouter:
     def __init__(self, config: dict, skills: SkillRegistry, github: GitHubTools, mcp: MCPRegistry, usage: UsageMeter):
@@ -615,6 +704,44 @@ class ModelRouter:
             return 180
         return 240
 
+    def _tools_for_skills(self, selected_skills: list[dict]) -> list[dict]:
+        """Only send Groq the tools the matched skills actually declare.
+
+        Previously every routing call shipped the full GitHub + MCP catalog
+        (now 15 MCP toolsets deep) regardless of what the turn was about, so
+        a plain "how's it going" paid the same prompt-token and
+        time-to-first-token cost as a repository operation. Skills already
+        declare `allowed_tools`; this is the one place that was never
+        actually reading it. `github_dispatch_agent` is excluded outright --
+        it's an internal step resolve_approval takes after a delegation plan
+        is approved, not something the router should be able to pick.
+        """
+        catalog = [t for t in self.github.openai_tools() + self.mcp.openai_tools() if t["function"]["name"] != "github_dispatch_agent"]
+        if not selected_skills:
+            return catalog + [self._delegation_tool()]
+        exact_names: set[str] = set()
+        prefixes: list[str] = []
+        wants_delegate = False
+        unrestricted = False
+        for skill in selected_skills:
+            allowed = skill.get("allowed_tools")
+            if allowed is None:
+                unrestricted = True
+                continue
+            for item in allowed:
+                if item == "delegate_to_gptoss":
+                    wants_delegate = True
+                elif item.endswith("*"):
+                    prefixes.append(item[:-1])
+                else:
+                    exact_names.add(item)
+        if unrestricted:
+            return catalog + [self._delegation_tool()]
+        tools = [t for t in catalog if t["function"]["name"] in exact_names or any(t["function"]["name"].startswith(p) for p in prefixes)]
+        if wants_delegate:
+            tools.append(self._delegation_tool())
+        return tools
+
     def route(self, text: str, history: list[dict], voice: bool = False) -> dict:
         key = os.environ.get("GROQ_API_KEY")
         if not key:
@@ -625,19 +752,21 @@ class ModelRouter:
             + [text]
         )
         selected_skills = self.skills.select(skill_context)
-        tools = self.github.openai_tools() + self.mcp.openai_tools() + [self._delegation_tool()]
+        tools = self._tools_for_skills(selected_skills)
+        request_body = {
+            "model": model,
+            "messages": self._messages(text, history, selected_skills),
+            "reasoning_effort": "none",
+            "temperature": 0.2,
+            "max_tokens": self.token_budget(text, history),
+        }
+        if tools:
+            request_body["tools"] = tools
+            request_body["tool_choice"] = "auto"
         response = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={
-                "model": model,
-                "messages": self._messages(text, history, selected_skills),
-                "tools": tools,
-                "tool_choice": "auto",
-                "reasoning_effort": "none",
-                "temperature": 0.2,
-                "max_tokens": self.token_budget(text, history),
-            },
+            json=request_body,
             timeout=30,
         )
         if not response.ok:
@@ -713,11 +842,61 @@ class ControlPlane:
     def set_skill_enabled(self, name: str, enabled: bool) -> dict:
         return self.skills.set_enabled(name, enabled)
 
+    def save_skill(self, skill: dict, original_name: str | None = None) -> dict:
+        return self.skills.save(skill, original_name)
+
+    def delete_skill(self, name: str) -> None:
+        self.skills.delete(name)
+
+    def save_mcp_server(self, name: str, cfg: dict, original_name: str | None = None) -> dict:
+        clean_name = str(name or "").strip().lower().replace(" ", "_")
+        if not re.fullmatch(r"[a-z0-9_]+", clean_name or ""):
+            raise ControlPlaneError("MCP server name must use lowercase letters, numbers, and underscores only")
+        if not str(cfg.get("url", "")).strip():
+            raise ControlPlaneError("MCP server needs a url")
+        servers = self.config.setdefault("mcp_servers", {})
+        if not original_name and clean_name in servers:
+            raise ControlPlaneError(f"An MCP server named {clean_name!r} already exists")
+        if original_name and original_name != clean_name and original_name in servers:
+            del servers[original_name]
+            self.mcp._tool_cache.pop(original_name, None)
+        entry = {
+            "enabled": bool(cfg.get("enabled", True)),
+            "transport": cfg.get("transport") or "streamable_http",
+            "url": cfg["url"].strip(),
+            "read_only": bool(cfg.get("read_only", False)),
+            "auth": cfg.get("auth") or None,
+            "toolsets": [str(t).strip() for t in cfg.get("toolsets", []) if str(t).strip()],
+        }
+        if entry["auth"] == "static_token" and cfg.get("token_env"):
+            entry["token_env"] = str(cfg["token_env"]).strip()
+        servers[clean_name] = entry
+        self.mcp._tool_cache.pop(clean_name, None)
+        tmp = self.config_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.config, indent=2), encoding="utf-8")
+        tmp.replace(self.config_path)
+        return next(item for item in self.mcp.snapshot() if item["name"] == clean_name)
+
+    def delete_mcp_server(self, name: str) -> None:
+        servers = self.config.get("mcp_servers", {})
+        if name not in servers:
+            raise ControlPlaneError("Unknown MCP server")
+        del servers[name]
+        self.mcp._tool_cache.pop(name, None)
+        tmp = self.config_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.config, indent=2), encoding="utf-8")
+        tmp.replace(self.config_path)
+
     def github_overview(self, owner: str | None = None, repo: str | None = None) -> dict:
         owner = owner or self.config["github"].get("default_owner")
         repo = repo or self.config["github"].get("default_repository")
         result = {"repositories": self.github.execute("github_list_repositories", {})}
         if owner and repo:
+            try:
+                result["repository"] = self.github.execute("github_get_repository", {"owner": owner, "repo": repo})
+            except Exception as e:
+                result["repository"] = None
+                result["repository_error"] = str(e)
             result["workflow_runs"] = self.github.execute("github_list_workflow_runs", {"owner": owner, "repo": repo})
             try:
                 result["runners"] = self.github.execute("github_list_runners", {"owner": owner, "repo": repo})
