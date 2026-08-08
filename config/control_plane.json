@@ -21,12 +21,12 @@
   "skills_directory": "skills",
   "mcp_servers": {
     "github": {
-      "enabled": false,
+      "enabled": true,
       "transport": "streamable_http",
-      "url": "https://api.githubcopilot.com/mcp/x/repos,issues,pull_requests,actions/readonly",
-      "read_only": true,
+      "url": "https://api.githubcopilot.com/mcp/x/repos,issues,pull_requests,actions,code_security,discussions,gists,notifications,orgs,projects,users,security_advisories,labels,dependabot,stargazers",
+      "read_only": false,
       "auth": "github_oauth",
-      "toolsets": ["repos", "issues", "pull_requests", "actions"]
+      "toolsets": ["repos", "issues", "pull_requests", "actions", "code_security", "discussions", "gists", "notifications", "orgs", "projects", "users", "security_advisories", "labels", "dependabot", "stargazers"]
     }
   }
 }

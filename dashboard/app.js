@@ -1,4 +1,4 @@
-const state = { snapshot: null, activeSession: null, mode: "voice", oauthTimer: null };
+const state = { snapshot: null, activeSession: null, mode: "voice", oauthTimer: null, lastMessageCount: -1 };
 const $ = (selector) => document.querySelector(selector);
 
 async function api(path, options = {}) {
@@ -34,13 +34,14 @@ function renderSessions() {
   $("#session-title").textContent = active?.title || "Session";
 }
 
-async function selectSession(id) {
-  state.activeSession = id;
-  renderSessions();
+async function fetchMessages(id) {
   const payload = await api(`/api/sessions/${encodeURIComponent(id)}/messages`);
+  return payload.messages.filter((item) => item.kind === "message");
+}
+
+function renderMessages(messages) {
   const list = $("#message-list");
   list.replaceChildren();
-  const messages = payload.messages.filter((item) => item.kind === "message");
   $("#empty-state").classList.toggle("hidden", messages.length > 0);
   for (const message of messages) {
     const card = el("article", `message ${message.role}`);
@@ -48,7 +49,27 @@ async function selectSession(id) {
     card.append(el("div", "message-meta", `${message.source || "system"}${message.model ? ` · ${message.model}` : ""}`));
     list.append(card);
   }
+  state.lastMessageCount = messages.length;
   list.lastElementChild?.scrollIntoView({ behavior: "smooth" });
+}
+
+async function selectSession(id) {
+  state.activeSession = id;
+  renderSessions();
+  renderMessages(await fetchMessages(id));
+}
+
+// Called on every poll tick so messages appended in the background (approvals
+// resolving, a delegated GPT-OSS run finishing, a voice turn coming in) show
+// up without the user having to click the session again.
+async function syncActiveMessages() {
+  if (!state.activeSession) return;
+  try {
+    const messages = await fetchMessages(state.activeSession);
+    if (messages.length !== state.lastMessageCount) renderMessages(messages);
+  } catch (error) {
+    // Transient poll failure -- next tick will retry. Don't toast every 1.5s.
+  }
 }
 
 function renderApprovals() {
@@ -123,7 +144,7 @@ function renderSnapshot() {
 }
 
 async function refresh() {
-  try { state.snapshot = await api("/api/snapshot"); renderSnapshot(); } catch (error) { toast(error.message); }
+  try { state.snapshot = await api("/api/snapshot"); renderSnapshot(); await syncActiveMessages(); } catch (error) { toast(error.message); }
 }
 
 async function refreshGitHub() {

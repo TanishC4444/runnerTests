@@ -50,6 +50,23 @@ def _load_json(path: Path, default: Any) -> Any:
         return default
 
 
+def _coerce_bool(value: Any, field: str) -> bool:
+    """Some Groq-hosted tool-calling models (e.g. qwen3.6-27b via Groq's
+    XML-style function-call parsing) emit Python-style boolean literals
+    ("True"/"False") as strings instead of JSON booleans. The tool schema
+    accepts either type so Groq's own strict validation doesn't reject the
+    call outright; this normalizes whatever comes through into a real bool."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes"):
+            return True
+        if lowered in ("false", "0", "no", ""):
+            return False
+    raise ControlPlaneError(f"Could not interpret {field!r} value {value!r} as a boolean")
+
+
 class SessionStore:
     def __init__(self, root: Path | None = None):
         self.root = root or SESSIONS_DIR
@@ -247,7 +264,7 @@ class GitHubTools:
             ToolSpec("github_list_workflow_runs", "List recent GitHub Actions workflow runs for a repository.", {"type": "object", "properties": repo_target, "required": ["owner", "repo"], "additionalProperties": False}),
             ToolSpec("github_list_runners", "List self-hosted runners configured for a repository.", {"type": "object", "properties": repo_target, "required": ["owner", "repo"], "additionalProperties": False}),
             ToolSpec("github_dispatch_agent", "Dispatch an approved GPT-OSS 20B task to a GitHub-hosted Actions runner. It works in the background and may open a reviewable pull request.", {"type": "object", "properties": {**repo_target, "task": {"type": "string"}, "session_id": {"type": "string"}, "ref": {"type": "string"}}, "required": ["owner", "repo", "task"], "additionalProperties": False}, True),
-            ToolSpec("github_create_repository", "Create a new repository after the user has explicitly chosen visibility and whether to initialize a README. A license and gitignore template may also be selected.", {"type": "object", "properties": {"name": {"type": "string"}, "description": {"type": "string"}, "private": {"type": "boolean"}, "auto_init": {"type": "boolean", "description": "Create an initial README commit"}, "license_template": {"type": "string", "description": "GitHub license keyword such as mit, apache-2.0, gpl-3.0, or empty for none"}, "gitignore_template": {"type": "string", "description": "GitHub gitignore template such as Python or Node, or empty for none"}}, "required": ["name", "private", "auto_init"], "additionalProperties": False}, True),
+            ToolSpec("github_create_repository", "Create a new repository after the user has explicitly chosen visibility and whether to initialize a README. A license and gitignore template may also be selected.", {"type": "object", "properties": {"name": {"type": "string"}, "description": {"type": "string"}, "private": {"type": ["boolean", "string"], "description": "true or false"}, "auto_init": {"type": ["boolean", "string"], "description": "Create an initial README commit; true or false"}, "license_template": {"type": "string", "description": "GitHub license keyword such as mit, apache-2.0, gpl-3.0, or empty for none"}, "gitignore_template": {"type": "string", "description": "GitHub gitignore template such as Python or Node, or empty for none"}}, "required": ["name", "private", "auto_init"], "additionalProperties": False}, True),
             ToolSpec("github_create_folder", "Create a folder in a repository by adding a .gitkeep file.", {"type": "object", "properties": {**repo_target, "path": {"type": "string"}, "branch": {"type": "string"}, "message": {"type": "string"}}, "required": ["owner", "repo", "path"], "additionalProperties": False}, True),
             ToolSpec("github_put_file", "Create or update one UTF-8 text file in a repository.", {"type": "object", "properties": {**repo_target, "path": {"type": "string"}, "content": {"type": "string"}, "branch": {"type": "string"}, "message": {"type": "string"}}, "required": ["owner", "repo", "path", "content"], "additionalProperties": False}, True),
         ]
@@ -317,9 +334,11 @@ class GitHubTools:
             authenticated_user = self._request("GET", "/user").get("login")
             if authenticated_user not in self.config["allowed_owners"]:
                 raise ControlPlaneError("The authenticated GitHub user is outside the configured owner allow-list")
-            if (arguments.get("license_template") or arguments.get("gitignore_template")) and not arguments["auto_init"]:
+            is_private = _coerce_bool(arguments["private"], "private")
+            auto_init = _coerce_bool(arguments["auto_init"], "auto_init")
+            if (arguments.get("license_template") or arguments.get("gitignore_template")) and not auto_init:
                 raise ControlPlaneError("A license or gitignore template requires repository initialization")
-            body = {"name": repo_name, "description": arguments.get("description", ""), "private": bool(arguments["private"]), "auto_init": bool(arguments["auto_init"])}
+            body = {"name": repo_name, "description": arguments.get("description", ""), "private": is_private, "auto_init": auto_init}
             if arguments.get("license_template"):
                 body["license_template"] = arguments["license_template"]
             if arguments.get("gitignore_template"):
