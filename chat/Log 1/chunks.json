@@ -602,5 +602,13 @@
     "raw_text": "okay here use less tokens compact yourself a little more and simply use one or two tours use limited tools to tell me the number of files are inside my gear repository titled runners test",
     "session_id": "1786154565008731000",
     "response": "I can't access that repository because the owner 'trip' isn't in my configured allow-list. Could you check if the repository is under a different owner, or add 'trip' to the allow-list?"
+  },
+  {
+    "datetime": "2026-08-07T21:04:37.541588",
+    "talk_seconds": 2.91,
+    "text": "Do I have a repository titled runners tests",
+    "raw_text": "do i have a repository titled runners tests",
+    "session_id": "1786154565008731000",
+    "response": "Routing failed: Groq planner failed with HTTP 429: {\"error\":{\"message\":\"Rate limit reached for model `qwen/qwen3.6-27b` in organization `org_01kbs1pwysfrev2qgn9w3ywasd` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Used 6210, Requested 3980. Please try again in 16.425s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing\",\"type\":\"tokens\",\"code\":\"rate_limit_exceeded\"}}"
   }
 ]
