@@ -6936,7 +6936,19 @@
     "reasoning_effort": "low",
     "max_tokens": 2000,
     "temperature": 0.2,
-    "num_ctx": 131072
+    "num_ctx": 131072,
+    "response": {
+      "message": {
+        "role": "assistant",
+        "content": "I\u2019m doing well, thank you! I\u2019ve just created a new private repository for you on GitHub called\u202fTanishC4444/my-new-repo. You can view it here: https://github.com/TanishC4444/my-new-repo.",
+        "thinking": "We need to summarize the read-only tool result. The request: \"How are you\". Tool used: github_create_repository, result shows repository created: full_name TanishC4444/my-new-repo, html_url https://github.com/TanishC4444/my-new- repo, private true.\n\nWe should answer briefly, fully answering request. So say something like: I'm fine, thanks. Also mention that a new private GitHub repo was created at the URL. Use plain spoken language, no markdown."
+      },
+      "usage": {
+        "prompt_tokens": 164,
+        "completion_tokens": 166,
+        "total_tokens": 330
+      }
+    }
   },
   {
     "request_id": "0a17a90524054ef9bec31d21bc20daf1",
