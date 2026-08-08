@@ -570,16 +570,13 @@ class MCPRegistry:
             raise ControlPlaneError(f"MCP tool failed: {payload['error']}")
         return payload.get("result", {})
 
-    def is_read_only(self, qualified_name: str) -> bool:
-        parts = qualified_name.split("__", 2)
-        if len(parts) != 3:
+    def _is_read_only(self, qualified_name: str) -> bool:
+        if qualified_name.startswith("mcp__"):
+            return self.mcp.is_read_only(qualified_name)
+        try:
+            return not self.github.spec(qualified_name).write
+        except ControlPlaneError:
             return False
-        _, server, tool_name = parts
-        cfg = self.config.get(server, {})
-        if cfg.get("read_only"):
-            return True
-        tool = next((item for item in self.list_tools(server) if item.get("name") == tool_name), {})
-        return bool(tool.get("annotations", {}).get("readOnlyHint"))
 
 
 class SkillRegistry:
@@ -768,23 +765,30 @@ class ModelRouter:
         return 160
 
     def _tools_for_skills(self, selected_skills: list[dict]) -> list[dict]:
-        """Every enabled tool, every turn -- by request, trusting each tool's
-        name/description to tell the model when to use it rather than
-        gating the list per-skill. `allowed_tools` in skill files is no
-        longer read for filtering (skills still contribute their
-        `instructions` text to the system prompt, just not a tool allow-list).
+        """Trim the tool catalog per turn instead of shipping every enabled
+        GitHub + MCP tool schema every time. If a matched skill declares
+        `allowed_tools`, only those are sent. If no skill matched (or matched
+        skills declare no allow-list), fall back to read-only tools only --
+        plain conversation and lookups don't need write tools on the wire.
         `github_dispatch_agent` stays excluded regardless -- it's an internal
-        step resolve_approval takes after a delegation plan is approved, not
-        something the router should ever pick directly.
-
-        Trade-off worth knowing: this maximizes what any turn can reach for,
-        but it also maximizes prompt size (full GitHub + every enabled MCP
-        toolset) on every single request -- there's no more per-minute token
-        ceiling to push against, but a bigger prompt is still more for a
-        CPU-bound local model to chew through before it even starts replying.
+        step resolve_approval takes after a delegation plan is approved.
         """
-        catalog = [t for t in self.github.openai_tools() + self.mcp.openai_tools() if t["function"]["name"] != "github_dispatch_agent"]
-        return catalog + [self._delegation_tool()]
+        catalog = {
+            t["function"]["name"]: t
+            for t in self.github.openai_tools() + self.mcp.openai_tools()
+            if t["function"]["name"] != "github_dispatch_agent"
+        }
+
+        allow = set()
+        for skill in selected_skills:
+            allow.update(skill.get("allowed_tools") or [])
+
+        if allow:
+            tools = [catalog[name] for name in allow if name in catalog]
+        else:
+            tools = [t for t in catalog.values() if self._is_read_only(t["function"]["name"])]
+
+        return tools + [self._delegation_tool()]
 
     def worker_briefing(self, selected_skills: list[dict]) -> dict:
         """Everything the background GitHub Actions worker needs but can't

@@ -4,7 +4,7 @@
   "enabled": true,
   "triggers": ["create a repo", "create a repository", "new repo", "new repository", "make a repo"],
   "mode": "write",
-  "model": "qwen/qwen3.6-27b",
+  "model": "gpt-oss:20b",
   "allowed_tools": ["github_create_repository"],
   "required_context": ["name", "visibility", "README choice", "license choice"],
   "instructions": "Before creating a repository, explicitly resolve public versus private, whether to initialize a README, and which license to use or none. Ask about a gitignore template only when the project language or stack is relevant. Combine missing choices into one concise question when possible."
