@@ -6967,7 +6967,19 @@
     "reasoning_effort": "low",
     "max_tokens": 2000,
     "temperature": 0.2,
-    "num_ctx": 131072
+    "num_ctx": 131072,
+    "response": {
+      "message": {
+        "role": "assistant",
+        "content": "Your new repository has been created: TanishC4444/test-repo. It\u2019s public and can be accessed at https://github.com/TanishC4444/test-repo.",
+        "thinking": "We need to summarize the tool result. The request: \"make a repo\". Tool used: github_create_repository. Result contains full_name, html_url, private flag. Summarize briefly. Use plain language, no markdown. Just answer."
+      },
+      "usage": {
+        "prompt_tokens": 162,
+        "completion_tokens": 96,
+        "total_tokens": 258
+      }
+    }
   },
   {
     "request_id": "7b55ec15cb9e4792bfcfdb98b1b01784",
