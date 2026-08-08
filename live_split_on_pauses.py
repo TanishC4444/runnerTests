@@ -8,16 +8,19 @@ pause length (PAUSE_MS), not Vosk's own built-in endpointer.
 Correction step: ASR sometimes mishears a word as a real-but-wrong word.
 language_tool_python catches spelling AND grammar/context issues.
 
-Response step: each chunk is sent to Groq (Qwen 3.6 27B, see groq_responder.py)
-right here, in-process -- that's the primary "brain" now. The cloud Qwen
-watcher (qwen_watcher.yml / watch_and_respond.py) only gets triggered as a
-backup, automatically, the first time Groq comes back rate-limited or
-otherwise fails.
+Response step: each chunk is posted to the local control plane's
+/api/voice-command endpoint, which routes it to the GPT-OSS 20B coordinator
+running on a GitHub Actions runner (gptoss_watcher.yml / watch_and_respond.py,
+reached through ollama_relay.py). run_all.py already triggers that watcher
+and waits for it to come up before this script's mic loop starts, so there
+is no separate "primary vs. fallback" model anymore -- one coordinator
+answers everything. If the local control plane HTTP server itself is
+unreachable, local_responder.py reaches the exact same coordinator directly
+as a second path (see its own docstring for why that's still worth having).
 
 Setup (run on your own machine, needs a mic):
     pip install vosk pyaudio webrtcvad language_tool_python requests --break-system-packages
-    export GROQ_API_KEY="gsk_..."   # Groq console -- required for the primary path
-    export GH_TOKEN="ghp_..."       # repo + workflow scope -- needed for the Qwen fallback trigger
+    export GH_TOKEN="ghp_..."       # repo + workflow scope -- needed for chunk sync and the GPT-OSS relay
 
 language_tool_python needs Java (JRE 17+):
     brew install openjdk
@@ -45,6 +48,7 @@ blob and retries optimistic-lock conflicts, so neither side performs local
 Git commits/rebases or overwrites the other's fields.
 """
 
+from __future__ import annotations
 import base64
 import json
 import os
@@ -61,7 +65,7 @@ import webrtcvad
 from vosk import Model, KaldiRecognizer
 import language_tool_python
 
-import groq_responder
+import local_responder
 
 SESSION_ID = os.environ.get("RUNNER_SESSION_ID")
 
@@ -71,6 +75,8 @@ SESSION_ID = os.environ.get("RUNNER_SESSION_ID")
 # IPC between the two processes on your machine, written to on VAD state
 # *transitions* only (not every audio frame) so it stays cheap.
 LOCAL_STATUS_FILE = os.path.join(tempfile.gettempdir(), "jarvis_local_status.json")
+LOCAL_RESPONSE_FILE = os.path.join(tempfile.gettempdir(), "jarvis_local_responses.jsonl")
+CONTROL_PLANE_VOICE_URL = "http://127.0.0.1:8765/api/voice-command"
 
 
 def _write_local_status(**fields):
@@ -91,12 +97,54 @@ def _write_local_status(**fields):
         # the actual mic pipeline.
         pass
 
+
+def _read_local_status() -> dict:
+    try:
+        with open(LOCAL_STATUS_FILE, "r", encoding="utf-8") as status_file:
+            return json.load(status_file)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _queue_local_response(response_id: str, text: str, user_text: str, usage: dict | None = None, logged: bool = False):
+    """Hand a primary response directly to run_all.py for immediate speech.
+
+    The remote chunks log remains the durable record, but local playback must
+    not depend on a successful Git pull. Only this listener writes the queue,
+    and run_all.py de-duplicates entries by response_id.
+    """
+    event = {"response_id": response_id, "text": text, "user_text": user_text, "usage": usage or {}, "logged": logged}
+    try:
+        with open(LOCAL_RESPONSE_FILE, "a", encoding="utf-8") as response_file:
+            response_file.write(json.dumps(event) + "\n")
+            response_file.flush()
+    except OSError as e:
+        # The durable remote response still exists and can be played after
+        # synchronization, so a local IPC problem is not a model failure and
+        # must not unnecessarily launch the backup model.
+        print(f"  [talkback] could not queue immediate local speech: {e}")
+
+
+def _ask_control_plane(user_text: str) -> str:
+    response = requests.post(
+        CONTROL_PLANE_VOICE_URL,
+        json={"text": user_text},
+        timeout=150,
+    )
+    if not response.ok:
+        raise RuntimeError(f"control plane HTTP {response.status_code}: {response.text[:500]}")
+    payload = response.json()
+    reply = (payload.get("text") or payload.get("message") or "").strip()
+    if not reply:
+        raise RuntimeError("control plane returned no spoken reply")
+    return reply
+
 MODEL_PATH = "model"
 SAMPLE_RATE = 16000
 
 FRAME_MS = 30                     # webrtcvad requires 10/20/30ms frames
 FRAME_BYTES = int(SAMPLE_RATE * FRAME_MS / 1000) * 2  # 16-bit samples
-PAUSE_MS = 600                     # how much silence = "you paused"
+PAUSE_MS = 420                     # how much silence = "you paused" (was 600; trimmed for snappier turn-taking)
 PAUSE_FRAMES = PAUSE_MS // FRAME_MS
 VAD_AGGRESSIVENESS = 3             # 0 (lenient) - 3 (strict about what counts as speech)
 BARGE_IN_CONFIRM_FRAMES = 5        # ~150ms of sustained speech before we call it a real barge-in
@@ -226,50 +274,47 @@ def worker_loop(work_q: "queue.Queue", tool, t_start: float):
         if SESSION_ID:
             entry["session_id"] = SESSION_ID
         _write_local_status(last_user_text=fixed, last_user_ts=time.time())
+        # The GPT-OSS coordinator round-trips through a GitHub Actions
+        # watcher now, so unlike the old Groq path this is never instant --
+        # flip the dashboard to "thinking" before blocking on it, not after.
+        _write_local_status(conv_state="thinking", conv_state_ts=time.time())
 
-        # Try Groq (Qwen 3.6 27B) first -- fast enough to answer right here,
-        # no round trip through GitHub/Actions. Attach the reply to the
+        # Primary path: the local control plane, which routes to the GPT-OSS
+        # coordinator on the GitHub Actions watcher. Attach the reply to the
         # entry BEFORE it's pushed: run_all.py's playback watcher already
         # speaks any chunk that arrives with a "response" field, so this
         # needs no changes on that side.
-        fallback_reason = None
         try:
-            reply = groq_responder.ask_groq(fixed)
+            reply = _ask_control_plane(fixed)
             entry["response"] = reply
-            print(f"  [groq] {reply[:80]!r}")
-            _write_local_status(
-                conv_state="speaking", conv_state_ts=time.time(), last_reply_text=reply
-            )
-        except groq_responder.GroqRateLimited:
-            print("  [groq] rate limited -- falling back to Qwen for this chunk")
-            fallback_reason = "rate limited"
-        except Exception as e:
-            print(f"  [groq] request failed ({e}) -- falling back to Qwen for this chunk")
-            fallback_reason = str(e)
+            print(f"  [gptoss coordinator] {reply[:80]!r}")
+            _queue_local_response(entry["datetime"], reply, fixed, logged=True)
+            _write_local_status(last_reply_text=reply)
+        except Exception as control_error:
+            print(f"  [coordinator] unavailable ({control_error}); trying direct fallback path")
+            try:
+                reply = local_responder.ask_local_model(fixed)
+                entry["response"] = reply
+                print(f"  [local fallback] {reply[:80]!r}")
+                _queue_local_response(entry["datetime"], reply, fixed, local_responder.last_usage)
+                _write_local_status(last_reply_text=reply)
+            except Exception as e:
+                # Both paths reach the same coordinator, so a failure here
+                # means the coordinator itself is unreachable/down, not that
+                # some other model needs triggering. This chunk goes into
+                # the durable log unanswered; nothing else will pick it up.
+                print(f"  [local fallback] request failed ({e}); this chunk goes unanswered")
 
-        pending.append((entry, fallback_reason))
+        pending.append(entry)
 
         # Retain failed entries in memory and flush them in order on the next
         # chunk. append_remote_chunk is idempotent, so ambiguous retries are safe.
         while pending:
-            pending_entry, pending_fallback_reason = pending[0]
+            pending_entry = pending[0]
             try:
                 append_remote_chunk(pending_entry)
                 print("[sync] chunk appended")
                 pending.pop(0)
-                # Store the unanswered chunk before starting a new watcher.
-                # Otherwise a slow Actions startup can see the chunk in its
-                # initial snapshot, classify it as pre-session history, and
-                # never answer the request that caused the fallback.
-                if pending_fallback_reason is not None:
-                    fallback_ready = groq_responder.ensure_qwen_fallback(
-                        pending_fallback_reason
-                    )
-                    if fallback_ready:
-                        _write_local_status(qwen_fallback_triggered=True)
-                # Cloud watcher has the chunk now and will start generating --
-                # this is what makes the dashboard show "thinking".
-                _write_local_status(conv_state="thinking", conv_state_ts=time.time())
             except Exception as e:
                 print(f"[sync] chunk append failed; will retry: {e}")
                 break
@@ -340,12 +385,26 @@ def live_split():
                                # speech_run so debouncing barge-in never
                                # affects chunk-boundary timing/accuracy
     barge_in_signaled = False
+    input_mode = "voice"
+    last_mode_check = 0.0
 
     try:
         while True:
             frame = stream.read(FRAME_BYTES // 2, exception_on_overflow=False)
 
-            if muted.is_set():
+            now_monotonic = time.monotonic()
+            if now_monotonic - last_mode_check >= 0.25:
+                next_mode = _read_local_status().get("input_mode", "voice")
+                if next_mode != input_mode:
+                    input_mode = next_mode
+                    rec = KaldiRecognizer(vosk_model, SAMPLE_RATE)
+                    _write_local_status(
+                        mic_state="muted" if input_mode == "text" else "listening",
+                        mic_state_ts=time.time(),
+                    )
+                last_mode_check = now_monotonic
+
+            if muted.is_set() or input_mode == "text":
                 # keep pulling from the stream so the buffer doesn't
                 # overflow, but don't process anything while muted —
                 # also clear any in-progress chunk state so unmuting

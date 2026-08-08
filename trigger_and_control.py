@@ -1,8 +1,10 @@
 """
 Local-side control script. Run this alongside your mic listener.
 
-Triggers the qwen_watcher.yml workflow, then waits. On Ctrl+C, it cancels
-the in-progress workflow run via the GitHub API before exiting.
+Triggers the gptoss_watcher.yml workflow (the GPT-OSS 20B coordinator run_all.py
+normally starts for you automatically), then waits. On Ctrl+C, it cancels
+the in-progress workflow run via the GitHub API before exiting. Useful for
+manually restarting/cancelling the watcher without going through run_all.py.
 
 Setup:
     export GH_TOKEN="ghp_..."       # your PAT, scoped to repo + workflow
@@ -23,7 +25,7 @@ if not TOKEN:
     sys.exit("Set GH_TOKEN as an environment variable first (export GH_TOKEN=...)")
 
 REPO = "TanishC4444/runnerTests"
-WORKFLOW_FILE = "qwen_watcher.yml"
+WORKFLOW_FILE = "gptoss_watcher.yml"
 
 BASE = f"https://api.github.com/repos/{REPO}/actions/workflows/{WORKFLOW_FILE}"
 HEADERS = {

@@ -1,0 +1,10 @@
+{
+  "name": "conversation",
+  "title": "Conversation",
+  "enabled": true,
+  "triggers": [],
+  "mode": "chat",
+  "model": "qwen/qwen3.6-27b",
+  "allowed_tools": [],
+  "instructions": "Answer in one or two short sentences, no filler. Do not claim an external action occurred unless a tool result is present."
+}
