@@ -899,10 +899,22 @@ class ModelRouter:
             if not calls:
                 return {"type": "message", "text": message.get("content") or "I need more detail before choosing a GitHub tool.", "model": model}
             call = calls[0]
-            try:
-                arguments = json.loads(call["function"].get("arguments") or "{}")
-            except json.JSONDecodeError as e:
-                raise ControlPlaneError(f"The model produced invalid tool arguments: {e}")
+            raw_arguments = call["function"].get("arguments") or "{}"
+            # Ollama's native /api/chat (used by watch_and_respond.py since
+            # the num_ctx fix) returns tool_calls[].function.arguments as an
+            # already-parsed JSON object, not a string -- unlike the old
+            # OpenAI-compatible endpoint / Groq, which both returned it
+            # JSON-encoded. json.loads() on a dict raises TypeError (not
+            # JSONDecodeError), which is what surfaced as "Routing failed:
+            # the JSON object must be str, bytes or bytearray, not dict".
+            # Accept either shape rather than assuming one.
+            if isinstance(raw_arguments, dict):
+                arguments = raw_arguments
+            else:
+                try:
+                    arguments = json.loads(raw_arguments)
+                except json.JSONDecodeError as e:
+                    raise ControlPlaneError(f"The model produced invalid tool arguments: {e}")
             name = call["function"]["name"]
             # Voice can propose exactly the same tools as typed, including
             # MCP writes -- it never executes them itself. `_is_safe_to_chain`

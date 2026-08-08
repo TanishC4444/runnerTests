@@ -30,6 +30,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 
 import requests
 
@@ -218,6 +219,15 @@ def run_completion(messages: list, tools: list | None, reasoning_effort: str, ma
     message = data["message"]
     if message.get("content"):
         message["content"] = clean_content(message["content"])
+    # Ollama's native /api/chat has been inconsistent across versions about
+    # including an "id" per tool call (some responses omit it entirely,
+    # unlike the OpenAI-compatible endpoint which always synthesizes one) --
+    # control_plane.py indexes call["id"] downstream when it appends the
+    # tool result message, so backfill a stable id here rather than let a
+    # KeyError surface as an opaque "Routing failed" the same way the
+    # dict-vs-string arguments mismatch did.
+    for call in message.get("tool_calls") or []:
+        call.setdefault("id", uuid.uuid4().hex)
     # Native /api/chat reports usage as prompt_eval_count/eval_count instead
     # of an OpenAI-shaped usage object -- normalize so every downstream
     # caller (control_plane.py's UsageTracker etc.) keeps working unchanged.
