@@ -16,6 +16,8 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
+  actions: read
 
 concurrency:
   group: gpt-oss-agent-${{ inputs.session_id }}
@@ -79,6 +81,23 @@ jobs:
           AGENT_SESSION_ID: ${{ inputs.session_id }}
           AGENT_MODEL: gpt-oss:20b
           PYTHONUNBUFFERED: "1"
+          # Optional: only set if you want the agent to be able to create new
+          # repositories. GITHUB_TOKEN below is repo-scoped and can't do this
+          # regardless of the `permissions:` block above -- repo creation is
+          # an account-level permission, so it needs a real PAT with `repo`
+          # scope (classic) or "Administration: write" (fine-grained), added
+          # as a repo secret named REPO_ADMIN_TOKEN. Leave the secret unset
+          # and create_repository just fails loudly instead of silently
+          # doing nothing -- see runner_agent.py.
+          REPO_ADMIN_TOKEN: ${{ secrets.REPO_ADMIN_TOKEN }}
+          AGENT_ALLOWED_OWNERS: ${{ github.repository_owner }}
+          # Optional: only needed if a task's mcp_servers includes one using
+          # auth: "static_token" (e.g. Notion, Linear, a private server).
+          # Shape: {"NOTION_TOKEN": "...", "LINEAR_TOKEN": "..."} -- keys
+          # must match that server's "token_env" in config/control_plane.json.
+          # servers using auth: "github_oauth" reuse REPO_ADMIN_TOKEN above
+          # instead and don't need an entry here.
+          MCP_STATIC_TOKENS: ${{ secrets.MCP_STATIC_TOKENS }}
         run: python3 runner_agent.py
 
       - name: Publish changes as a pull request

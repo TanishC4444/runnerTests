@@ -151,21 +151,41 @@ class UsageMeter:
 
 
 class GitHubAuth:
+    # In-memory-only storage meant every process restart (crash, redeploy,
+    # `--reload` picking up a file save) silently dropped the OAuth session:
+    # token() would start returning None and every write would fail with
+    # "GitHub is not connected" with no obvious cause. Persisting to a
+    # user-only-readable file under DATA_DIR survives restarts; env vars
+    # still take priority for anyone running this in CI/containers instead.
+    _TOKEN_FILE = DATA_DIR / "github_token.json"
+
     def __init__(self):
-        self._oauth_token: str | None = None
+        self._oauth_token: str | None = self._load_persisted()
         self._device: dict | None = None
         self.lock = threading.Lock()
 
+    def _load_persisted(self) -> str | None:
+        data = _load_json(self._TOKEN_FILE, {})
+        return data.get("access_token") if isinstance(data, dict) else None
+
+    def _persist(self, token: str | None):
+        self._TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._TOKEN_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"access_token": token} if token else {}), encoding="utf-8")
+        tmp.replace(self._TOKEN_FILE)
+        try:
+            os.chmod(self._TOKEN_FILE, 0o600)
+        except OSError:
+            pass
+
     def token(self) -> str | None:
-        return self._oauth_token or os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+        return os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or self._oauth_token
 
     def source(self) -> str:
+        if os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN"):
+            return "environment"
         if self._oauth_token:
-            return "oauth-memory"
-        if os.environ.get("GITHUB_TOKEN"):
-            return "environment"
-        if os.environ.get("GH_TOKEN"):
-            return "environment"
+            return "oauth-persisted"
         return "none"
 
     def status(self) -> dict:
@@ -226,6 +246,7 @@ class GitHubAuth:
             with self.lock:
                 self._oauth_token = payload["access_token"]
                 self._device = None
+                self._persist(self._oauth_token)
             return {"status": "connected", "scope": payload.get("scope", "")}
         error = payload.get("error", "authorization_pending")
         if error == "slow_down":
@@ -240,6 +261,7 @@ class GitHubAuth:
         with self.lock:
             self._oauth_token = None
             self._device = None
+            self._persist(None)
 
 
 @dataclass
@@ -394,8 +416,12 @@ class GitHubTools:
             owner, repo = arguments["owner"], arguments["repo"]
             self._validate_repo(owner, repo)
             task = arguments["task"].strip()
-            if not task or len(task) > 12000:
-                raise ControlPlaneError("Agent task must contain 1 to 12,000 characters")
+            if not task or len(task) > 55000:
+                # GitHub's workflow_dispatch API caps the combined inputs
+                # payload at 65,535 bytes; 55k leaves headroom for
+                # session_id/ref and JSON overhead. Was 12000 -- too small
+                # once skill instructions and MCP tool schemas ride along.
+                raise ControlPlaneError("Agent task must contain 1 to 55,000 characters")
             self._request(
                 "POST",
                 f"/repos/{quote(owner)}/{quote(repo)}/actions/workflows/agent_worker.yml/dispatches",
@@ -760,6 +786,47 @@ class ModelRouter:
         catalog = [t for t in self.github.openai_tools() + self.mcp.openai_tools() if t["function"]["name"] != "github_dispatch_agent"]
         return catalog + [self._delegation_tool()]
 
+    def worker_briefing(self, selected_skills: list[dict]) -> dict:
+        """Everything the background GitHub Actions worker needs but can't
+        get for itself: which skills apply to this task (their full
+        instructions text, not just a name the small worker model would have
+        to guess the meaning of) and which MCP tools are reachable, with
+        enough of each tool's real schema that the worker can form a correct
+        `mcp_call` action instead of guessing argument names. Built here (by
+        the router, which already has this loaded) rather than left for the
+        worker to rediscover on a runner that starts from a clean checkout
+        every time.
+        """
+        skills = [
+            {"name": s.get("name"), "title": s.get("title"), "instructions": s.get("instructions", "")}
+            for s in selected_skills
+        ]
+        mcp_tools = []
+        mcp_servers = {}
+        for server, cfg in self.mcp.config.items():
+            if not cfg.get("enabled"):
+                continue
+            mcp_servers[server] = {
+                "url": cfg.get("url"),
+                "transport": cfg.get("transport"),
+                "auth": cfg.get("auth"),
+                "token_env": cfg.get("token_env"),
+                "read_only": bool(cfg.get("read_only")),
+            }
+            try:
+                tools = self.mcp.list_tools(server)
+            except Exception:
+                continue
+            for tool in tools:
+                mcp_tools.append({
+                    "qualified_name": f"mcp__{server}__{tool['name']}",
+                    "server": server,
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("inputSchema", {"type": "object", "properties": {}}),
+                    "read_only": bool(cfg.get("read_only")) or bool(tool.get("annotations", {}).get("readOnlyHint")),
+                })
+        return {"skills": skills, "mcp_tools": mcp_tools, "mcp_servers": mcp_servers}
+
     # Caps how many tool calls the model can chain in a single turn before it
     # must produce an answer. Each step is a full relay round trip (queue a
     # job, wait for the GH Actions watcher to answer) -- this bounds
@@ -819,7 +886,7 @@ class ModelRouter:
             # through to `_submit`'s approval flow whether it came from voice
             # or the dashboard.
             if not self._is_safe_to_chain(name):
-                return {"type": "tool", "name": name, "arguments": arguments, "model": model}
+                return {"type": "tool", "name": name, "arguments": arguments, "model": model, "skills": selected_skills}
 
             # Safe read: run it now and hand the result back to the same
             # model call instead of stopping the turn, so "check X then read
@@ -960,6 +1027,15 @@ class ControlPlane:
         self.sessions.append(self.active_session_id, {"kind": "message", "role": "user", "source": "voice", "content": user_text})
         self.sessions.append(self.active_session_id, {"kind": "message", "role": "assistant", "source": "voice", "model": model, "content": assistant_text})
 
+    def _auto_approve_enabled(self) -> bool:
+        # Single switch for "pump out agents without babysitting the
+        # dashboard": when this is False every write (including the
+        # delegate_to_gptoss dispatch that starts agent_worker.yml) skips the
+        # approval queue and runs immediately. allow_workflow_file_edits is
+        # deliberately NOT part of this switch -- it's checked separately in
+        # GitHubTools._validate_path so this flag can't be used to reach it.
+        return not self.config["safeguards"].get("require_approval_for_writes", True)
+
     def _submit(self, session_id: str, text: str, source: str, voice: bool) -> dict:
         text = text.strip()
         if not text:
@@ -974,18 +1050,24 @@ class ControlPlane:
         if routed["type"] == "message":
             self.sessions.append(session_id, {"kind": "message", "role": "assistant", "source": source, "model": routed.get("model"), "content": routed["text"]})
             return routed
+        auto = self._auto_approve_enabled()
         if routed["name"] == "delegate_to_gptoss":
             approval_id = f"a-{uuid.uuid4().hex[:12]}"
-            approval = {"id": approval_id, "session_id": session_id, "tool": routed["name"], "arguments": routed["arguments"], "model": routed.get("model"), "status": "pending", "created_at": _now(), "expires_at": _now() + int(self.config["safeguards"].get("approval_ttl_seconds", 900))}
+            approval = {"id": approval_id, "session_id": session_id, "tool": routed["name"], "arguments": routed["arguments"], "model": routed.get("model"), "status": "pending", "created_at": _now(), "expires_at": _now() + int(self.config["safeguards"].get("approval_ttl_seconds", 900)), "skills": routed.get("skills", [])}
             with self.lock:
                 self.approvals[approval_id] = approval
             self.sessions.append(session_id, {"kind": "approval", **approval})
+            if auto:
+                outcome = self._execute_approved(approval_id)
+                n = outcome["result"]["dispatched"]
+                return {"type": "tool_result", "message": f"Dispatched {n} plan(s) to GitHub Actions.", "result": outcome["result"]}
             reply = "I have a scoped plan ready for GPT-OSS 20B. Review and approve it in the dashboard, and I can keep talking with you while it runs in the background."
             self.sessions.append(session_id, {"kind": "message", "role": "assistant", "source": source, "model": routed.get("model"), "content": reply})
             return {"type": "approval", "approval": approval, "text": reply, "model": routed.get("model")}
         is_mcp = routed["name"].startswith("mcp__")
         spec = None if is_mcp else self.github.spec(routed["name"])
-        needs_approval = (is_mcp and not self.mcp.is_read_only(routed["name"])) or (spec and spec.write and self.config["safeguards"].get("require_approval_for_writes", True))
+        is_write = (is_mcp and not self.mcp.is_read_only(routed["name"])) or (spec and spec.write)
+        needs_approval = is_write and not auto
         if needs_approval:
             approval_id = f"a-{uuid.uuid4().hex[:12]}"
             approval = {"id": approval_id, "session_id": session_id, "tool": routed["name"], "arguments": routed["arguments"], "model": routed.get("model"), "status": "pending", "created_at": _now(), "expires_at": _now() + int(self.config["safeguards"].get("approval_ttl_seconds", 900))}
@@ -1019,13 +1101,27 @@ class ControlPlane:
         if not approve:
             self.sessions.append(item["session_id"], {"kind": "approval_result", "approval_id": approval_id, "status": "rejected"})
             return {"status": "rejected"}
+        return self._execute_approved(approval_id)
+
+    def _execute_approved(self, approval_id: str) -> dict:
+        with self.lock:
+            item = self.approvals[approval_id]
         try:
             if item["tool"] == "delegate_to_gptoss":
                 plan = item["arguments"]
+                briefing = self.router.worker_briefing(item.get("skills", []))
                 subtasks = plan.get("subtasks") or [{"objective": plan["objective"], "steps": plan["steps"], "acceptance_criteria": plan["acceptance_criteria"], "constraints": plan.get("constraints", [])}]
                 runs = []
                 for index, sub in enumerate(subtasks):
-                    task = json.dumps({"objective": sub["objective"], "steps": sub["steps"], "acceptance_criteria": sub["acceptance_criteria"], "constraints": sub.get("constraints", [])}, indent=2)
+                    task = json.dumps({
+                        "objective": sub["objective"],
+                        "steps": sub["steps"],
+                        "acceptance_criteria": sub["acceptance_criteria"],
+                        "constraints": sub.get("constraints", []),
+                        "skills": briefing["skills"],
+                        "mcp_tools": briefing["mcp_tools"],
+                        "mcp_servers": briefing["mcp_servers"],
+                    }, indent=2)
                     # Each dispatch gets its own session id, which is also
                     # agent_worker.yml's concurrency-group key. Reusing the
                     # dashboard session id here (the old behavior) meant every
