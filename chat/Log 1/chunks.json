@@ -610,5 +610,12 @@
     "raw_text": "do i have a repository titled runners tests",
     "session_id": "1786154565008731000",
     "response": "Routing failed: Groq planner failed with HTTP 429: {\"error\":{\"message\":\"Rate limit reached for model `qwen/qwen3.6-27b` in organization `org_01kbs1pwysfrev2qgn9w3ywasd` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Used 6210, Requested 3980. Please try again in 16.425s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing\",\"type\":\"tokens\",\"code\":\"rate_limit_exceeded\"}}"
+  },
+  {
+    "datetime": "2026-08-08T00:42:51.460486",
+    "talk_seconds": 0.09,
+    "text": "Insurgents first two years but not as a baseline that and do you want a declaration of an all agent to cause as well as GPC for over for them",
+    "raw_text": "insurgents first two years but not as a baseline that and are you want a declaration of a all agent to cause as well as gpc for over for them",
+    "session_id": "1786167405093261000"
   }
 ]
