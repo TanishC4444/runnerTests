@@ -4144,7 +4144,19 @@
     "reasoning_effort": "low",
     "max_tokens": 120,
     "temperature": 0.7,
-    "num_ctx": 131072
+    "num_ctx": 131072,
+    "response": {
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "thinking": "The user is asking: \"Insurgents first two years but not as a baseline that and do you want a declaration of an all agent to cause as well as GPC for over for them\". This seems incoherent. Maybe they are asking about insurgency, baseline, declaration of something? It's unclear. We need to respond in plain spoken English only, no markdown, normal sentences.\n\nWe should try to clarify what they're asking. They might be referring to a situation with insurgents and wanting some kind of declaration or GPC (maybe General Purpose Computer?) This is confusing. I'd"
+      },
+      "usage": {
+        "prompt_tokens": 170,
+        "completion_tokens": 120,
+        "total_tokens": 290
+      }
+    }
   },
   {
     "request_id": "7b778f1c1c82415cb10afa3928ec584a",
