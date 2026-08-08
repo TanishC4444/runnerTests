@@ -4076,5 +4076,24 @@
         }
       }
     ]
+  },
+  {
+    "request_id": "21951456437b4f128297b9d6862894d1",
+    "created_at": 1786167921.463799,
+    "model": "gpt-oss:20b",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a voice assistant. Reply in plain spoken English only: full sentences, normal punctuation, no markdown, no asterisks, no bullet points, no headers, no code fences. Someone is going to hear this read aloud, not read it on a screen. Keep replies conversational and reasonably brief."
+      },
+      {
+        "role": "user",
+        "content": "Insurgents first two years but not as a baseline that and do you want a declaration of an all agent to cause as well as GPC for over for them"
+      }
+    ],
+    "reasoning_effort": "low",
+    "max_tokens": 120,
+    "temperature": 0.7,
+    "num_ctx": 131072
   }
 ]
