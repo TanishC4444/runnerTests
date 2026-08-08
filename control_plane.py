@@ -646,17 +646,38 @@ class ModelRouter:
             "type": "function",
             "function": {
                 "name": "delegate_to_gptoss",
-                "description": "Submit a complete, scoped engineering plan to the background GPT-OSS 20B GitHub Actions worker. Call only after material ambiguities are resolved.",
+                "description": (
+                    "Submit a complete, scoped engineering plan to the background GPT-OSS 20B GitHub Actions worker. "
+                    "Call only after material ambiguities are resolved. If the work has genuinely independent pieces "
+                    "(e.g. separate modules/files that don't depend on each other's output), list each as its own "
+                    "entry in `subtasks` instead of one long sequential plan -- each one gets dispatched to its own "
+                    "parallel GitHub Actions runner at approval time instead of running one after another."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "owner": {"type": "string"},
                         "repo": {"type": "string"},
                         "base_branch": {"type": "string"},
-                        "objective": {"type": "string"},
-                        "steps": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                        "objective": {"type": "string", "description": "Overall goal. If subtasks are used, this is the umbrella description."},
+                        "steps": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Ordered steps for a single sequential run. Omit/ignore in favor of `subtasks` when the work parallelizes."},
                         "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "minItems": 1},
                         "constraints": {"type": "array", "items": {"type": "string"}},
+                        "subtasks": {
+                            "type": "array",
+                            "description": "Optional. Independent chunks of work, each dispatched to its own parallel runner instead of one sequential worker. Only use when the pieces truly don't depend on each other's output.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "objective": {"type": "string"},
+                                    "steps": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                                    "acceptance_criteria": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                                    "constraints": {"type": "array", "items": {"type": "string"}},
+                                },
+                                "required": ["objective", "steps", "acceptance_criteria"],
+                                "additionalProperties": False,
+                            },
+                        },
                     },
                     "required": ["owner", "repo", "base_branch", "objective", "steps", "acceptance_criteria"],
                     "additionalProperties": False,
@@ -717,42 +738,22 @@ class ModelRouter:
         return 160
 
     def _tools_for_skills(self, selected_skills: list[dict]) -> list[dict]:
-        """Only send Groq the tools the matched skills actually declare.
+        """Every enabled tool, every turn -- by request, trusting each tool's
+        name/description to tell the model when to use it rather than
+        gating the list per-skill. `allowed_tools` in skill files is no
+        longer read for filtering (skills still contribute their
+        `instructions` text to the system prompt, just not a tool allow-list).
+        `github_dispatch_agent` stays excluded regardless -- it's an internal
+        step resolve_approval takes after a delegation plan is approved, not
+        something the router should ever pick directly.
 
-        Previously every routing call shipped the full GitHub + MCP catalog
-        (now 15 MCP toolsets deep) regardless of what the turn was about, so
-        a plain "how's it going" paid the same prompt-token and
-        time-to-first-token cost as a repository operation. Skills already
-        declare `allowed_tools`; this is the one place that was never
-        actually reading it. `github_dispatch_agent` is excluded outright --
-        it's an internal step resolve_approval takes after a delegation plan
-        is approved, not something the router should be able to pick.
+        Trade-off worth knowing: this maximizes what any turn can reach for,
+        but it also maximizes prompt size (full GitHub + every enabled MCP
+        toolset) on every single request, which pushes harder against Groq's
+        per-minute token limit than the filtered version did.
         """
         catalog = [t for t in self.github.openai_tools() + self.mcp.openai_tools() if t["function"]["name"] != "github_dispatch_agent"]
-        if not selected_skills:
-            return catalog + [self._delegation_tool()]
-        exact_names: set[str] = set()
-        prefixes: list[str] = []
-        wants_delegate = False
-        unrestricted = False
-        for skill in selected_skills:
-            allowed = skill.get("allowed_tools")
-            if allowed is None:
-                unrestricted = True
-                continue
-            for item in allowed:
-                if item == "delegate_to_gptoss":
-                    wants_delegate = True
-                elif item.endswith("*"):
-                    prefixes.append(item[:-1])
-                else:
-                    exact_names.add(item)
-        if unrestricted:
-            return catalog + [self._delegation_tool()]
-        tools = [t for t in catalog if t["function"]["name"] in exact_names or any(t["function"]["name"].startswith(p) for p in prefixes)]
-        if wants_delegate:
-            tools.append(self._delegation_tool())
-        return tools
+        return catalog + [self._delegation_tool()]
 
     # Caps how many tool calls the model can chain in a single turn before it
     # must produce an answer. Each step is a full Groq round trip, so this
@@ -818,8 +819,12 @@ class ModelRouter:
             except json.JSONDecodeError as e:
                 raise ControlPlaneError(f"The model produced invalid tool arguments: {e}")
             name = call["function"]["name"]
-            if voice and name.startswith("mcp__") and not self.mcp.is_read_only(name):
-                return {"type": "message", "text": "That MCP action is not read-only, so I need you to use the dashboard approval flow.", "model": model}
+            # Voice can propose exactly the same tools as typed, including
+            # MCP writes -- it never executes them itself. `_is_safe_to_chain`
+            # is the only real gate here, and anything that fails it (any
+            # write, delegate_to_gptoss, any non-read-only MCP tool) falls
+            # through to `_submit`'s approval flow whether it came from voice
+            # or the dashboard.
             if not self._is_safe_to_chain(name):
                 return {"type": "tool", "name": name, "arguments": arguments, "model": model}
 
@@ -1020,8 +1025,25 @@ class ControlPlane:
         try:
             if item["tool"] == "delegate_to_gptoss":
                 plan = item["arguments"]
-                task = json.dumps({"objective": plan["objective"], "steps": plan["steps"], "acceptance_criteria": plan["acceptance_criteria"], "constraints": plan.get("constraints", [])}, indent=2)
-                result = self.github.execute("github_dispatch_agent", {"owner": plan["owner"], "repo": plan["repo"], "task": task, "session_id": item["session_id"], "ref": plan.get("base_branch") or "main"})
+                subtasks = plan.get("subtasks") or [{"objective": plan["objective"], "steps": plan["steps"], "acceptance_criteria": plan["acceptance_criteria"], "constraints": plan.get("constraints", [])}]
+                runs = []
+                for index, sub in enumerate(subtasks):
+                    task = json.dumps({"objective": sub["objective"], "steps": sub["steps"], "acceptance_criteria": sub["acceptance_criteria"], "constraints": sub.get("constraints", [])}, indent=2)
+                    # Each dispatch gets its own session id, which is also
+                    # agent_worker.yml's concurrency-group key. Reusing the
+                    # dashboard session id here (the old behavior) meant every
+                    # approval from the same session queued behind the last
+                    # one -- one worker at a time no matter how many plans you
+                    # approved. A unique id per dispatch (and per subtask,
+                    # when fanned out) puts each in its own concurrency group
+                    # so they run as independent, parallel runners instead.
+                    dispatch_session_id = f"{item['session_id']}-{approval_id}" + (f"-{index}" if len(subtasks) > 1 else "")
+                    dispatch = self.github.execute("github_dispatch_agent", {"owner": plan["owner"], "repo": plan["repo"], "task": task, "session_id": dispatch_session_id, "ref": plan.get("base_branch") or "main"})
+                    runs.append({**dispatch, "dispatch_session_id": dispatch_session_id, "objective": sub["objective"]})
+                item["dispatch_owner"] = plan["owner"]
+                item["dispatch_repo"] = plan["repo"]
+                item["dispatch_runs"] = [{"dispatch_session_id": r["dispatch_session_id"], "objective": r["objective"], "seen_run_id": None, "reported": False} for r in runs]
+                result = {"dispatched": len(runs), "runs": runs}
             else:
                 result = self.mcp.execute(item["tool"], item["arguments"]) if item["tool"].startswith("mcp__") else self.github.execute(item["tool"], item["arguments"])
         except Exception as e:
@@ -1030,7 +1052,15 @@ class ControlPlane:
             raise
         item["status"] = "completed"
         self.sessions.append(item["session_id"], {"kind": "tool_result", "approval_id": approval_id, "tool": item["tool"], "arguments": item["arguments"], "result": result})
-        message = "GPT-OSS 20B is now working on the approved plan in GitHub Actions. You can keep talking to Qwen while it runs." if item["tool"] == "delegate_to_gptoss" else f"Completed the approved {item['tool']} action."
+        if item["tool"] == "delegate_to_gptoss":
+            n = result["dispatched"]
+            message = (
+                "GPT-OSS 20B is now working on the approved plan in GitHub Actions. I'll let you know here (and say something out loud) when it finishes."
+                if n == 1 else
+                f"GPT-OSS 20B is now working on {n} independent plans in parallel, each on its own GitHub Actions runner. I'll report back as each one finishes."
+            )
+        else:
+            message = f"Completed the approved {item['tool']} action."
         self.sessions.append(item["session_id"], {"kind": "message", "role": "assistant", "source": "tool", "content": message})
         return {"status": "completed", "result": result}
 

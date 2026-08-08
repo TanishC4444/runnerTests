@@ -1,4 +1,4 @@
-const state = { snapshot: null, activeSession: null, mode: "voice", oauthTimer: null, lastMessageCount: -1, editingSkill: null, editingMcp: null };
+const state = { snapshot: null, activeSession: null, mode: "voice", oauthTimer: null, lastMessageCount: -1, editingSkill: null, editingMcp: null, seenGptossRuns: new Set() };
 const $ = (selector) => document.querySelector(selector);
 
 async function api(path, options = {}) {
@@ -360,10 +360,30 @@ for (const tab of document.querySelectorAll(".ops-tab")) {
 
 /* -------------------------------- snapshot ---------------------------------- */
 
+// GPT-OSS completion notifications piggyback on /api/snapshot's existing
+// approvals data -- resolve_approval already tags each dispatched run with
+// a `dispatch_session_id`, and the background watcher in run_all.py flips
+// `reported` to true the moment that run's workflow completes. Diffing that
+// flag here means a toast fires the instant it's noticed, regardless of
+// which session happens to be open -- no separate notifications endpoint.
+function checkGptossCompletions(approvals) {
+  for (const approval of approvals) {
+    if (approval.tool !== "delegate_to_gptoss") continue;
+    for (const run of approval.dispatch_runs || []) {
+      const key = `${approval.id}:${run.dispatch_session_id}`;
+      if (run.reported && !state.seenGptossRuns.has(key)) {
+        state.seenGptossRuns.add(key);
+        toast(`GPT-OSS finished: ${run.objective}`);
+      }
+    }
+  }
+}
+
 function renderSnapshot() {
   const snap = state.snapshot;
   state.activeSession ||= snap.active_session_id;
   renderSessions(); renderApprovals(); renderUsage();
+  checkGptossCompletions(snap.approvals);
   renderMcpServers(snap.mcp_servers);
   renderSkills(snap.skills);
   $("#github-dot").classList.toggle("on", snap.github.connected);

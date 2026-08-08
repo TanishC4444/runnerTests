@@ -581,6 +581,70 @@ def load_local_responses() -> list[dict]:
         return []
 
 
+def _queue_local_response(response_id: str, text: str, user_text: str = "", usage: dict | None = None):
+    """Write to the same local IPC file live_split_on_pauses.py's own
+    _queue_local_response uses. response_watcher_loop below already polls
+    this file and speaks anything new in it -- so this one write is all it
+    takes to make a GPT-OSS completion talk out loud, with zero changes to
+    the playback side. `logged=True` and an empty user_text keep it out of
+    record_voice_turn -- this isn't a conversational Q&A pair."""
+    event = {"response_id": response_id, "text": text, "user_text": user_text, "usage": usage or {}, "logged": True}
+    try:
+        with open(LOCAL_RESPONSE_FILE, "a", encoding="utf-8") as response_file:
+            response_file.write(json.dumps(event) + "\n")
+            response_file.flush()
+    except OSError as e:
+        print(f"[gptoss] could not queue completion speech: {e}")
+
+
+GPTOSS_POLL_SECONDS = 20
+
+
+def gptoss_completion_watcher(stop_event: threading.Event, control_plane: ControlPlane):
+    """Polls GitHub Actions for every GPT-OSS run this session has dispatched
+    (single or fanned-out parallel subtasks) and, the moment one finishes,
+    drops a message into its dashboard session and queues a short spoken
+    line -- so approving a delegation doesn't mean going to check GitHub
+    yourself later to find out what happened.
+
+    `dispatch_runs[].reported` (set here) is also what the dashboard itself
+    polls via /api/snapshot to fire its own toast notification -- so this is
+    the one place completion actually gets detected, for both surfaces."""
+    while not stop_event.is_set():
+        with control_plane.lock:
+            approvals = list(control_plane.approvals.values())
+        for approval in approvals:
+            if approval.get("tool") != "delegate_to_gptoss" or approval.get("status") != "completed":
+                continue
+            pending_runs = [r for r in (approval.get("dispatch_runs") or []) if not r.get("reported")]
+            if not pending_runs:
+                continue
+            owner, repo = approval.get("dispatch_owner"), approval.get("dispatch_repo")
+            if not owner or not repo:
+                continue
+            try:
+                workflow_runs = control_plane.github.execute("github_list_workflow_runs", {"owner": owner, "repo": repo})
+            except Exception as e:
+                print(f"[gptoss] could not poll workflow runs: {e}")
+                continue
+            for run_entry in pending_runs:
+                match = next((wr for wr in workflow_runs if run_entry["dispatch_session_id"] in (wr.get("display_title") or "")), None)
+                if not match or match.get("status") != "completed":
+                    continue
+                run_entry["reported"] = True
+                conclusion = match.get("conclusion") or "unknown"
+                ok = conclusion == "success"
+                detail = (
+                    f"GPT-OSS finished \"{run_entry['objective']}\" -- {conclusion}. "
+                    f"Check {owner}/{repo} for the pull request. {match.get('html_url', '')}"
+                )
+                control_plane.sessions.append(approval["session_id"], {"kind": "message", "role": "assistant", "source": "gptoss", "content": detail})
+                spoken = f"GPT-OSS {'finished' if ok else 'stopped, with a problem, on'} the task: {run_entry['objective']}."
+                _queue_local_response(f"gptoss-{approval['id']}-{run_entry['dispatch_session_id']}", spoken)
+                print(f"[gptoss] {detail}")
+        stop_event.wait(GPTOSS_POLL_SECONDS)
+
+
 def git_pull_quiet():
     """Best-effort pull -- if it fails (e.g. a lock held by the listener's
     own concurrent pull), just skip this cycle and try again shortly."""
@@ -689,6 +753,8 @@ def main():
     stop_event = threading.Event()
     responder = threading.Thread(target=response_watcher_loop, args=(stop_event, control_plane), daemon=True)
     responder.start()
+    completion_watcher = threading.Thread(target=gptoss_completion_watcher, args=(stop_event, control_plane), daemon=True)
+    completion_watcher.start()
 
     print(f"\nReady. Idle until you speak. Dashboard: http://localhost:{DASHBOARD_PORT}")
     print("Ctrl+C to stop everything.\n")

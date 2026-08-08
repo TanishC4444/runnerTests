@@ -99,6 +99,32 @@ class ControlPlaneSafetyTests(unittest.TestCase):
         self.assertEqual(call.args[0], "github_dispatch_agent")
         self.assertIn("acceptance_criteria", call.args[1]["task"])
 
+    def test_delegation_with_subtasks_dispatches_one_parallel_run_each(self):
+        plan = {
+            "owner": "TanishC4444",
+            "repo": "runnerTests",
+            "base_branch": "main",
+            "objective": "Add health checks to three services",
+            "steps": ["placeholder"],
+            "acceptance_criteria": ["placeholder"],
+            "subtasks": [
+                {"objective": "Health check for service A", "steps": ["Implement"], "acceptance_criteria": ["Returns 200"]},
+                {"objective": "Health check for service B", "steps": ["Implement"], "acceptance_criteria": ["Returns 200"]},
+            ],
+        }
+        self.control.router.route = Mock(
+            return_value={"type": "tool", "name": "delegate_to_gptoss", "arguments": plan, "model": "qwen/qwen3.6-27b"}
+        )
+        proposed = self.control.submit(self.control.active_session_id, "Add health checks to three services")
+        self.control.github.execute = Mock(return_value={"dispatched": True, "workflow": "agent_worker.yml", "model": "gpt-oss:20b"})
+        result = self.control.resolve_approval(proposed["approval"]["id"], True)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(self.control.github.execute.call_count, 2)
+        session_ids = [call.args[1]["session_id"] for call in self.control.github.execute.call_args_list]
+        self.assertEqual(len(set(session_ids)), 2, "each subtask must get its own concurrency-group session id")
+        approval = self.control.approvals[proposed["approval"]["id"]]
+        self.assertEqual(len(approval["dispatch_runs"]), 2)
+
     def test_qwen_coordinator_receives_history_skills_and_delegation_schema(self):
         response = Mock()
         response.ok = True
