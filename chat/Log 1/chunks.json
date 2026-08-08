@@ -570,5 +570,13 @@
     "raw_text": "let's get this started a can you open up my runners casting get hub repository and tell me how many files by count there are inside",
     "session_id": "1786154565008731000",
     "response": "I don't see a repository named \"runners casting get hub\" in your list. Could you clarify the exact repository name?"
+  },
+  {
+    "datetime": "2026-08-07T21:03:15.132456",
+    "talk_seconds": 0.78,
+    "text": "trip",
+    "raw_text": "trip",
+    "session_id": "1786154565008731000",
+    "response": "Routing failed: Groq planner failed with HTTP 429: {\"error\":{\"message\":\"Rate limit reached for model `qwen/qwen3.6-27b` in organization `org_01kbs1pwysfrev2qgn9w3ywasd` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Used 6466, Requested 3576. Please try again in 15.314999999s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing\",\"type\":\"tokens\",\"code\":\"rate_limit_exceeded\"}}"
   }
 ]
