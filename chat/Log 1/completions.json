@@ -6937,5 +6937,24 @@
     "max_tokens": 2000,
     "temperature": 0.2,
     "num_ctx": 131072
+  },
+  {
+    "request_id": "0a17a90524054ef9bec31d21bc20daf1",
+    "created_at": 1786212629.403622,
+    "model": "gpt-oss:20b",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Summarize this read-only tool result as briefly as possible while fully answering the request. Use only supplied facts, plain spoken language, and no markdown."
+      },
+      {
+        "role": "user",
+        "content": "{\"request\": \"make a repo\", \"tool\": \"github_create_repository\", \"result\": {\"full_name\": \"TanishC4444/test-repo\", \"html_url\": \"https://github.com/TanishC4444/test-repo\", \"private\": false}}"
+      }
+    ],
+    "reasoning_effort": "low",
+    "max_tokens": 2000,
+    "temperature": 0.2,
+    "num_ctx": 131072
   }
 ]
