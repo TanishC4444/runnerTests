@@ -6889,5 +6889,24 @@
         }
       }
     ]
+  },
+  {
+    "request_id": "5ae9fd286e0a42cdb0e06610023fbff2",
+    "created_at": 1786212603.738702,
+    "model": "gpt-oss:20b",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Summarize this read-only tool result as briefly as possible while fully answering the request. Use only supplied facts, plain spoken language, and no markdown."
+      },
+      {
+        "role": "user",
+        "content": "{\"request\": \"How are you\", \"tool\": \"github_create_repository\", \"result\": {\"full_name\": \"TanishC4444/my-new-repo\", \"html_url\": \"https://github.com/TanishC4444/my-new-repo\", \"private\": true}}"
+      }
+    ],
+    "reasoning_effort": "low",
+    "max_tokens": 2000,
+    "temperature": 0.2,
+    "num_ctx": 131072
   }
 ]
