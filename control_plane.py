@@ -22,6 +22,8 @@ from urllib.parse import quote
 
 import requests
 
+import ollama_relay
+
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = ROOT / "config" / "control_plane.json"
@@ -51,11 +53,11 @@ def _load_json(path: Path, default: Any) -> Any:
 
 
 def _coerce_bool(value: Any, field: str) -> bool:
-    """Some Groq-hosted tool-calling models (e.g. qwen3.6-27b via Groq's
-    XML-style function-call parsing) emit Python-style boolean literals
+    """Some tool-calling models emit Python-style boolean literals
     ("True"/"False") as strings instead of JSON booleans. The tool schema
-    accepts either type so Groq's own strict validation doesn't reject the
-    call outright; this normalizes whatever comes through into a real bool."""
+    accepts either type so a strict server-side validator upstream doesn't
+    reject the call outright; this normalizes whatever comes through into a
+    real bool before it's used."""
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -555,7 +557,7 @@ class MCPRegistry:
 
 
 class SkillRegistry:
-    """File-backed skill packages used as Qwen routing instructions."""
+    """File-backed skill packages used as GPT-OSS routing instructions."""
 
     def __init__(self, directory: Path):
         self.directory = directory
@@ -607,7 +609,7 @@ class SkillRegistry:
             "enabled": bool(skill.get("enabled", True)),
             "triggers": [str(t).strip() for t in skill.get("triggers", []) if str(t).strip()],
             "mode": skill.get("mode") or "chat",
-            "model": skill.get("model") or "qwen/qwen3.6-27b",
+            "model": skill.get("model") or "gpt-oss:20b",
             "allowed_tools": [str(t).strip() for t in skill.get("allowed_tools", []) if str(t).strip()],
             "instructions": str(skill.get("instructions", "")).strip(),
         }
@@ -687,15 +689,17 @@ class ModelRouter:
 
     def _messages(self, text: str, history: list[dict], skills: list[dict]) -> list[dict]:
         skill_text = "\n".join(f"- {skill['title']}: {skill.get('instructions', '')}" for skill in skills)
-        # Brevity comes first and is unconditional -- every extra word here is
-        # extra prompt tokens on every single turn, and short replies cost
-        # fewer completion tokens too. Both count against Groq's per-minute
-        # token limit for this model, so this line is the main lever against
-        # rate-limit errors, not a style preference.
+        # Brevity is still unconditional even though Groq's rate limit is gone
+        # (this now runs on a locally-hosted gpt-oss:20b Actions watcher, not a
+        # metered cloud API) -- fewer completion tokens means less time spent
+        # generating on CPU-only Actions hardware, which is the real
+        # bottleneck now: latency, not a token ceiling.
         system = (
             "Reply in as few words as possible -- one or two short sentences unless the user "
-            "explicitly asks for more. No filler, no restating the question, no hedging.\n\n"
-            "You are the always-available Qwen coordinator and conversational assistant. "
+            "explicitly asks for more. No filler, no restating the question, no hedging. Plain "
+            "spoken language only, never markdown (no asterisks, headers, bullets, or code fences) "
+            "-- this is often read aloud.\n\n"
+            "You are the always-available GPT-OSS coordinator and conversational assistant. "
             "Use read tools immediately when they can answer or discover missing facts. "
             "For engineering work delegated to GPT-OSS, ask only high-impact questions whose answers "
             "materially affect implementation; ask no more than three concise questions at once. "
@@ -749,15 +753,17 @@ class ModelRouter:
 
         Trade-off worth knowing: this maximizes what any turn can reach for,
         but it also maximizes prompt size (full GitHub + every enabled MCP
-        toolset) on every single request, which pushes harder against Groq's
-        per-minute token limit than the filtered version did.
+        toolset) on every single request -- there's no more per-minute token
+        ceiling to push against, but a bigger prompt is still more for a
+        CPU-bound local model to chew through before it even starts replying.
         """
         catalog = [t for t in self.github.openai_tools() + self.mcp.openai_tools() if t["function"]["name"] != "github_dispatch_agent"]
         return catalog + [self._delegation_tool()]
 
     # Caps how many tool calls the model can chain in a single turn before it
-    # must produce an answer. Each step is a full Groq round trip, so this
-    # bounds worst-case token/latency cost, not just infinite-loop risk.
+    # must produce an answer. Each step is a full relay round trip (queue a
+    # job, wait for the GH Actions watcher to answer) -- this bounds
+    # worst-case latency, not just infinite-loop risk.
     MAX_TOOL_STEPS = 4
 
     def _is_safe_to_chain(self, name: str) -> bool:
@@ -776,9 +782,6 @@ class ModelRouter:
             return False
 
     def route(self, text: str, history: list[dict], voice: bool = False) -> dict:
-        key = os.environ.get("GROQ_API_KEY")
-        if not key:
-            raise ControlPlaneError("GROQ_API_KEY is not configured")
         model = self.config["tool_router"]
         skill_context = " ".join(
             [str(item.get("content", "")) for item in history[-12:] if item.get("role") == "user"]
@@ -789,27 +792,17 @@ class ModelRouter:
         messages = self._messages(text, history, selected_skills)
 
         for _ in range(self.MAX_TOOL_STEPS):
-            request_body = {
-                "model": model,
-                "messages": messages,
-                "reasoning_effort": "none",
-                "temperature": 0.2,
-                "max_tokens": self.token_budget(text, history),
-            }
-            if tools:
-                request_body["tools"] = tools
-                request_body["tool_choice"] = "auto"
-            response = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json=request_body,
-                timeout=30,
-            )
-            if not response.ok:
-                raise ControlPlaneError(f"Groq planner failed with HTTP {response.status_code}: {response.text[:500]}")
-            payload = response.json()
-            self.usage.add(model, payload.get("usage"))
-            message = payload["choices"][0]["message"]
+            try:
+                completion = ollama_relay.request_completion(
+                    model=model,
+                    messages=messages,
+                    tools=tools or None,
+                    max_tokens=self.token_budget(text, history),
+                )
+            except ollama_relay.RelayError as e:
+                raise ControlPlaneError(str(e))
+            self.usage.add(model, completion.get("usage"))
+            message = completion["message"]
             calls = message.get("tool_calls") or []
             if not calls:
                 return {"type": "message", "text": message.get("content") or "I need more detail before choosing a GitHub tool.", "model": model}
@@ -842,17 +835,21 @@ class ModelRouter:
         return {"type": "message", "text": "I gathered some information but hit my per-turn tool-call limit -- ask again more specifically.", "model": model}
 
     def summarize(self, request: str, tool_name: str, result: Any) -> str:
-        key = os.environ.get("GROQ_API_KEY")
-        response = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json={"model": self.config["tool_router"], "messages": [{"role": "system", "content": "Summarize this read-only tool result as briefly as possible while fully answering the request. Use only supplied facts and no markdown."}, {"role": "user", "content": json.dumps({"request": request, "tool": tool_name, "result": result}, default=str)[:20000]}], "reasoning_effort": "none", "temperature": 0.2, "max_tokens": 180 if len(request.split()) < 20 else 280},
-            timeout=30,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        self.usage.add(self.config["tool_router"], payload.get("usage"))
-        return payload["choices"][0]["message"]["content"].strip()
+        model = self.config["tool_router"]
+        messages = [
+            {"role": "system", "content": "Summarize this read-only tool result as briefly as possible while fully answering the request. Use only supplied facts, plain spoken language, and no markdown."},
+            {"role": "user", "content": json.dumps({"request": request, "tool": tool_name, "result": result}, default=str)[:20000]},
+        ]
+        try:
+            completion = ollama_relay.request_completion(
+                model=model,
+                messages=messages,
+                max_tokens=180 if len(request.split()) < 20 else 280,
+            )
+        except ollama_relay.RelayError as e:
+            raise ControlPlaneError(str(e))
+        self.usage.add(model, completion.get("usage"))
+        return completion["message"]["content"].strip()
 
 
 class ControlPlane:
@@ -959,7 +956,7 @@ class ControlPlane:
                 result["runners_error"] = str(e)
         return result
 
-    def record_voice_turn(self, user_text: str, assistant_text: str, model: str = "qwen/qwen3.6-27b"):
+    def record_voice_turn(self, user_text: str, assistant_text: str, model: str = "gpt-oss:20b"):
         self.sessions.append(self.active_session_id, {"kind": "message", "role": "user", "source": "voice", "content": user_text})
         self.sessions.append(self.active_session_id, {"kind": "message", "role": "assistant", "source": "voice", "model": model, "content": assistant_text})
 
@@ -1080,7 +1077,7 @@ class ControlPlane:
             "github": self.auth.status(),
             "mcp_servers": self.mcp.snapshot(),
             "skills": self.skills.list(),
-            "models": {**self.config["models"], "groq_key_configured": bool(os.environ.get("GROQ_API_KEY")), "worker_location": "github-actions"},
+            "models": {**self.config["models"], "relay_configured": bool(os.environ.get("GH_TOKEN")), "worker_location": "github-actions"},
             "usage": self.usage.snapshot(),
             "voice": voice_status or {},
             "safeguards": self.config["safeguards"],

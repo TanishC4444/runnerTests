@@ -23,7 +23,7 @@ class ControlPlaneSafetyTests(unittest.TestCase):
                 "type": "tool",
                 "name": "github_create_repository",
                 "arguments": {"name": "safe-test", "private": True},
-                "model": "qwen/qwen3.6-27b",
+                "model": "gpt-oss:20b",
             }
         )
         result = self.control.submit(
@@ -48,7 +48,7 @@ class ControlPlaneSafetyTests(unittest.TestCase):
                 "type": "tool",
                 "name": "github_create_folder",
                 "arguments": {"owner": "TanishC4444", "repo": "runnerTests", "path": "demo"},
-                "model": "qwen/qwen3.6-27b",
+                "model": "gpt-oss:20b",
             }
         )
         proposed = self.control.submit(self.control.active_session_id, "Create demo folder")
@@ -67,7 +67,7 @@ class ControlPlaneSafetyTests(unittest.TestCase):
                 "type": "tool",
                 "name": "github_list_workflow_runs",
                 "arguments": {"owner": "TanishC4444", "repo": "runnerTests"},
-                "model": "qwen/qwen3.6-27b",
+                "model": "gpt-oss:20b",
             }
         )
         self.control.github.execute = Mock(return_value=[{"status": "completed"}])
@@ -88,7 +88,7 @@ class ControlPlaneSafetyTests(unittest.TestCase):
             "constraints": ["Do not edit workflows"],
         }
         self.control.router.route = Mock(
-            return_value={"type": "tool", "name": "delegate_to_gptoss", "arguments": plan, "model": "qwen/qwen3.6-27b"}
+            return_value={"type": "tool", "name": "delegate_to_gptoss", "arguments": plan, "model": "gpt-oss:20b"}
         )
         proposed = self.control.submit(self.control.active_session_id, "Add a health check")
         self.assertEqual(proposed["type"], "approval")
@@ -113,7 +113,7 @@ class ControlPlaneSafetyTests(unittest.TestCase):
             ],
         }
         self.control.router.route = Mock(
-            return_value={"type": "tool", "name": "delegate_to_gptoss", "arguments": plan, "model": "qwen/qwen3.6-27b"}
+            return_value={"type": "tool", "name": "delegate_to_gptoss", "arguments": plan, "model": "gpt-oss:20b"}
         )
         proposed = self.control.submit(self.control.active_session_id, "Add health checks to three services")
         self.control.github.execute = Mock(return_value={"dispatched": True, "workflow": "agent_worker.yml", "model": "gpt-oss:20b"})
@@ -125,11 +125,9 @@ class ControlPlaneSafetyTests(unittest.TestCase):
         approval = self.control.approvals[proposed["approval"]["id"]]
         self.assertEqual(len(approval["dispatch_runs"]), 2)
 
-    def test_qwen_coordinator_receives_history_skills_and_delegation_schema(self):
-        response = Mock()
-        response.ok = True
-        response.json.return_value = {
-            "choices": [{"message": {"content": "Which repository should I use, and what result should the test verify?"}}],
+    def test_coordinator_receives_history_skills_and_delegation_schema(self):
+        completion = {
+            "message": {"content": "Which repository should I use, and what result should the test verify?"},
             "usage": {"prompt_tokens": 10, "completion_tokens": 8},
         }
         history = [
@@ -137,13 +135,12 @@ class ControlPlaneSafetyTests(unittest.TestCase):
             {"kind": "message", "role": "assistant", "content": "What environment is this for?"},
             {"kind": "message", "role": "user", "content": "Production"},
         ]
-        with patch.dict(module.os.environ, {"GROQ_API_KEY": "test-key"}), patch.object(module.requests, "post", return_value=response) as post:
+        with patch.object(module.ollama_relay, "request_completion", return_value=completion) as relay:
             result = self.control.router.route("Production", history, voice=True)
         self.assertEqual(result["type"], "message")
-        request = post.call_args.kwargs["json"]
-        self.assertTrue(any(tool["function"]["name"] == "delegate_to_gptoss" for tool in request["tools"]))
-        self.assertTrue(any(message.get("content") == "What environment is this for?" for message in request["messages"]))
-        self.assertIn("no more than three", request["messages"][0]["content"])
+        self.assertTrue(any(tool["function"]["name"] == "delegate_to_gptoss" for tool in relay.call_args.kwargs["tools"]))
+        self.assertTrue(any(message.get("content") == "What environment is this for?" for message in relay.call_args.kwargs["messages"]))
+        self.assertIn("no more than three", relay.call_args.kwargs["messages"][0]["content"])
 
     def test_route_chains_a_safe_read_tool_before_answering(self):
         """A read tool should execute inside route() itself and feed its
@@ -151,41 +148,29 @@ class ControlPlaneSafetyTests(unittest.TestCase):
         this is what lets one request resolve 'check X then tell me Y' and
         also skips the separate summarize() round trip for the common case."""
         tool_call = {"id": "call_1", "type": "function", "function": {"name": "github_list_repositories", "arguments": "{}"}}
-        first = Mock(ok=True)
-        first.json.return_value = {
-            "choices": [{"message": {"content": None, "tool_calls": [tool_call]}}],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 5},
-        }
-        second = Mock(ok=True)
-        second.json.return_value = {
-            "choices": [{"message": {"content": "You have 2 repositories."}}],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 5},
-        }
+        first = {"message": {"content": None, "tool_calls": [tool_call]}, "usage": {"prompt_tokens": 5, "completion_tokens": 5}}
+        second = {"message": {"content": "You have 2 repositories."}, "usage": {"prompt_tokens": 5, "completion_tokens": 5}}
         self.control.github.execute = Mock(return_value=[{"full_name": "a/a"}, {"full_name": "a/b"}])
-        with patch.dict(module.os.environ, {"GROQ_API_KEY": "test-key"}), patch.object(module.requests, "post", side_effect=[first, second]) as post:
+        with patch.object(module.ollama_relay, "request_completion", side_effect=[first, second]) as relay:
             result = self.control.router.route("how many repos do I have", [], voice=False)
         self.assertEqual(result["type"], "message")
         self.assertEqual(result["text"], "You have 2 repositories.")
-        self.assertEqual(post.call_count, 2)
+        self.assertEqual(relay.call_count, 2)
         self.control.github.execute.assert_called_once_with("github_list_repositories", {})
-        second_request_messages = post.call_args.kwargs["json"]["messages"]
-        self.assertTrue(any(m.get("role") == "tool" and m.get("tool_call_id") == "call_1" for m in second_request_messages))
+        second_call_messages = relay.call_args.kwargs["messages"]
+        self.assertTrue(any(m.get("role") == "tool" and m.get("tool_call_id") == "call_1" for m in second_call_messages))
 
     def test_route_stops_chaining_on_a_write_tool(self):
         """A write tool must stop the loop and be handed back for approval,
         never executed inside the chain."""
         tool_call = {"id": "call_2", "type": "function", "function": {"name": "github_create_folder", "arguments": '{"owner":"TanishC4444","repo":"runnerTests","path":"demo"}'}}
-        response = Mock(ok=True)
-        response.json.return_value = {
-            "choices": [{"message": {"content": None, "tool_calls": [tool_call]}}],
-            "usage": {"prompt_tokens": 5, "completion_tokens": 5},
-        }
+        completion = {"message": {"content": None, "tool_calls": [tool_call]}, "usage": {"prompt_tokens": 5, "completion_tokens": 5}}
         self.control.github.execute = Mock()
-        with patch.dict(module.os.environ, {"GROQ_API_KEY": "test-key"}), patch.object(module.requests, "post", return_value=response) as post:
+        with patch.object(module.ollama_relay, "request_completion", return_value=completion) as relay:
             result = self.control.router.route("make a demo folder", [], voice=False)
         self.assertEqual(result["type"], "tool")
         self.assertEqual(result["name"], "github_create_folder")
-        self.assertEqual(post.call_count, 1)
+        self.assertEqual(relay.call_count, 1)
         self.control.github.execute.assert_not_called()
 
     def test_token_budgets_expand_only_for_more_complex_intents(self):

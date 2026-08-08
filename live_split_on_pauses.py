@@ -8,16 +8,19 @@ pause length (PAUSE_MS), not Vosk's own built-in endpointer.
 Correction step: ASR sometimes mishears a word as a real-but-wrong word.
 language_tool_python catches spelling AND grammar/context issues.
 
-Response step: each chunk is sent to Groq (Qwen 3.6 27B, see groq_responder.py)
-right here, in-process -- that's the primary "brain" now. The cloud Qwen
-watcher (qwen_watcher.yml / watch_and_respond.py) only gets triggered as a
-backup, automatically, the first time Groq comes back rate-limited or
-otherwise fails.
+Response step: each chunk is posted to the local control plane's
+/api/voice-command endpoint, which routes it to the GPT-OSS 20B coordinator
+running on a GitHub Actions runner (gptoss_watcher.yml / watch_and_respond.py,
+reached through ollama_relay.py). run_all.py already triggers that watcher
+and waits for it to come up before this script's mic loop starts, so there
+is no separate "primary vs. fallback" model anymore -- one coordinator
+answers everything. If the local control plane HTTP server itself is
+unreachable, local_responder.py reaches the exact same coordinator directly
+as a second path (see its own docstring for why that's still worth having).
 
 Setup (run on your own machine, needs a mic):
     pip install vosk pyaudio webrtcvad language_tool_python requests --break-system-packages
-    export GROQ_API_KEY="gsk_..."   # Groq console -- required for the primary path
-    export GH_TOKEN="ghp_..."       # repo + workflow scope -- needed for the Qwen fallback trigger
+    export GH_TOKEN="ghp_..."       # repo + workflow scope -- needed for chunk sync and the GPT-OSS relay
 
 language_tool_python needs Java (JRE 17+):
     brew install openjdk
@@ -62,7 +65,7 @@ import webrtcvad
 from vosk import Model, KaldiRecognizer
 import language_tool_python
 
-import groq_responder
+import local_responder
 
 SESSION_ID = os.environ.get("RUNNER_SESSION_ID")
 
@@ -271,57 +274,47 @@ def worker_loop(work_q: "queue.Queue", tool, t_start: float):
         if SESSION_ID:
             entry["session_id"] = SESSION_ID
         _write_local_status(last_user_text=fixed, last_user_ts=time.time())
+        # The GPT-OSS coordinator round-trips through a GitHub Actions
+        # watcher now, so unlike the old Groq path this is never instant --
+        # flip the dashboard to "thinking" before blocking on it, not after.
+        _write_local_status(conv_state="thinking", conv_state_ts=time.time())
 
-        # Try Groq (Qwen 3.6 27B) first -- fast enough to answer right here,
-        # no round trip through GitHub/Actions. Attach the reply to the
+        # Primary path: the local control plane, which routes to the GPT-OSS
+        # coordinator on the GitHub Actions watcher. Attach the reply to the
         # entry BEFORE it's pushed: run_all.py's playback watcher already
         # speaks any chunk that arrives with a "response" field, so this
         # needs no changes on that side.
-        fallback_reason = None
         try:
             reply = _ask_control_plane(fixed)
             entry["response"] = reply
-            print(f"  [qwen coordinator] {reply[:80]!r}")
+            print(f"  [gptoss coordinator] {reply[:80]!r}")
             _queue_local_response(entry["datetime"], reply, fixed, logged=True)
             _write_local_status(last_reply_text=reply)
         except Exception as control_error:
-            print(f"  [coordinator] unavailable ({control_error}); trying direct Groq voice path")
+            print(f"  [coordinator] unavailable ({control_error}); trying direct fallback path")
             try:
-                reply = groq_responder.ask_groq(fixed)
+                reply = local_responder.ask_local_model(fixed)
                 entry["response"] = reply
-                print(f"  [groq direct] {reply[:80]!r}")
-                _queue_local_response(entry["datetime"], reply, fixed, groq_responder.last_usage)
+                print(f"  [local fallback] {reply[:80]!r}")
+                _queue_local_response(entry["datetime"], reply, fixed, local_responder.last_usage)
                 _write_local_status(last_reply_text=reply)
-            except groq_responder.GroqRateLimited:
-                print("  [groq] rate limited -- falling back to Qwen for this chunk")
-                fallback_reason = "rate limited"
             except Exception as e:
-                print(f"  [groq] request failed ({e}) -- falling back to Qwen for this chunk")
-                fallback_reason = str(e)
+                # Both paths reach the same coordinator, so a failure here
+                # means the coordinator itself is unreachable/down, not that
+                # some other model needs triggering. This chunk goes into
+                # the durable log unanswered; nothing else will pick it up.
+                print(f"  [local fallback] request failed ({e}); this chunk goes unanswered")
 
-        pending.append((entry, fallback_reason))
+        pending.append(entry)
 
         # Retain failed entries in memory and flush them in order on the next
         # chunk. append_remote_chunk is idempotent, so ambiguous retries are safe.
         while pending:
-            pending_entry, pending_fallback_reason = pending[0]
+            pending_entry = pending[0]
             try:
                 append_remote_chunk(pending_entry)
                 print("[sync] chunk appended")
                 pending.pop(0)
-                # Store the unanswered chunk before starting a new watcher.
-                # Otherwise a slow Actions startup can see the chunk in its
-                # initial snapshot, classify it as pre-session history, and
-                # never answer the request that caused the fallback.
-                if pending_fallback_reason is not None:
-                    fallback_ready = groq_responder.ensure_qwen_fallback(
-                        pending_fallback_reason
-                    )
-                    if fallback_ready:
-                        _write_local_status(qwen_fallback_triggered=True)
-                # Cloud watcher has the chunk now and will start generating --
-                # this is what makes the dashboard show "thinking".
-                _write_local_status(conv_state="thinking", conv_state_ts=time.time())
             except Exception as e:
                 print(f"[sync] chunk append failed; will retry: {e}")
                 break

@@ -392,8 +392,8 @@ function renderSnapshot() {
   $("#oauth-status").classList.toggle("on", snap.github.connected);
   $("#github-key-status").textContent = snap.github.connected ? "Configured" : "Missing";
   $("#github-key-status").classList.toggle("on", snap.github.connected);
-  $("#groq-key-status").textContent = snap.models.groq_key_configured ? "Configured" : "Missing";
-  $("#groq-key-status").classList.toggle("on", snap.models.groq_key_configured);
+  $("#groq-key-status").textContent = snap.models.relay_configured ? "Configured" : "Missing";
+  $("#groq-key-status").classList.toggle("on", snap.models.relay_configured);
   $("#worker-pulse").className = "pulse blue";
   const voice = snap.voice || {}; const voiceState = voice.mic_state === "speech" ? "Listening" : (voice.conv_state || "Ready");
   $("#voice-state").textContent = voiceState[0].toUpperCase() + voiceState.slice(1);

@@ -8,26 +8,47 @@ python3 run_all.py
 ```
 
 Open `http://127.0.0.1:8765`. No local AI model or Ollama installation is
-required. The local machine runs the microphone, dashboard, approval boundary,
-and speech playback only.
+required on your machine -- GPT-OSS 20B runs entirely on a GitHub Actions
+runner, reached over `ollama_relay.py`. The local machine runs the microphone,
+dashboard, approval boundary, and speech playback only.
 
-`run_all.py` automatically loads `.env`. Keep `GROQ_API_KEY` and `GH_TOKEN`
-there. The repository Actions secret `RUNNER_PAT` is still required by the
-emergency Qwen 2.5 voice watcher.
+`run_all.py` automatically loads `.env`. Keep `GH_TOKEN` there -- it's the only
+credential needed now (there is no more Groq/hosted API key). The repository
+Actions secret `RUNNER_PAT` is required for both `gptoss_watcher.yml` (the
+live coordinator) and `agent_worker.yml` (background engineering jobs).
+
+Every session, `run_all.py` triggers `gptoss_watcher.yml` and waits for it to
+report ready before starting the microphone. Cold start (installing Ollama,
+pulling the ~14GB model if the cache missed, loading it) is typically
+1-3+ minutes, and CPU-only generation on the runner is meaningfully slower
+per turn than a hosted API would be -- this is the tradeoff of running the
+model on Actions infrastructure instead of a local GPU/API, and it's expected
+behavior, not a bug.
 
 ## How commands route
 
-- Qwen 3.6 27B remains the live conversational coordinator.
-- Qwen token ceilings adapt by intent: short follow-ups stay small, reads get a
+- GPT-OSS 20B, running on the `gptoss_watcher.yml` Actions runner, is the only
+  conversational coordinator now -- both tool-calling routing decisions and
+  plain chat replies go through it, relayed via `chat/Log 1/completions.json`
+  (control_plane.py/ollama_relay.py write requests, watch_and_respond.py
+  answers them).
+- Token ceilings adapt by intent: short follow-ups stay small, reads get a
   moderate ceiling, and structured engineering plans receive more room.
 - Voice and typed commands both pass through the same session-aware router.
+- A safe read tool can be chained automatically inside one router turn (up to
+  `ModelRouter.MAX_TOOL_STEPS`); every other tool call stops the loop and
+  returns to the caller for approval.
 - Read-only GitHub and enabled read-only MCP tools may run immediately.
-- Simple GitHub writes become one-time dashboard approvals.
-- Engineering tasks trigger clarification when material context is missing.
+- Every other GitHub write, MCP write, and agent dispatch becomes a one-time
+  dashboard approval -- nothing executes until you approve it.
 - Once repository, objective, constraints, and success criteria are clear,
-  Qwen creates ordered steps and queues a GPT-OSS delegation for approval.
-- After approval, GPT-OSS 20B runs asynchronously on `ubuntu-latest`; Qwen and
-  the voice assistant remain available during the job.
+  GPT-OSS creates ordered steps and queues a `delegate_to_gptoss` dispatch
+  (optionally fanned out across `subtasks`, each its own parallel runner) for
+  approval.
+- After approval, GPT-OSS 20B runs the actual engineering work asynchronously
+  on `agent_worker.yml`; the live coordinator and voice assistant remain
+  available while it runs, and the dashboard/voice announce completion when
+  it's done.
 
 ## GitHub-hosted GPT-OSS worker
 
@@ -63,9 +84,10 @@ supports GitHub OAuth Device Flow:
 4. complete the displayed device code.
 
 OAuth tokens remain in process memory. They are not returned to browser code,
-written into sessions, or persisted after restart. The microphone fallback
-still needs `GH_TOKEN` because a child process cannot inherit an OAuth token
-obtained after that process started.
+written into sessions, or persisted after restart. `GH_TOKEN` is still
+required regardless, because the microphone process and the GPT-OSS relay
+(both separate from the dashboard's own OAuth flow) cannot inherit an OAuth
+token obtained after they started.
 
 ## Skills infrastructure
 
@@ -78,7 +100,7 @@ Skills are JSON packages in `skills/`. Each package defines:
 - model;
 - allowed tools;
 - required context; and
-- instructions injected into Qwen.
+- instructions injected into the coordinator.
 
 Add another `*.json` file to create a future skill. The registry discovers it
 at runtime, the dashboard lists it, and its enabled state can be toggled there.

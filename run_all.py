@@ -1,23 +1,26 @@
 """
 Run this one script. It:
-  1. Starts the local mic listener (live_split_on_pauses.py) immediately --
-     no waiting on the cloud. Groq (Qwen 3.6 27B) is the primary brain now and
-     answers in-process on that side; the GitHub Actions Qwen watcher is
-     backup only, and live_split_on_pauses.py triggers it itself, lazily,
-     the first time Groq comes back rate-limited.
-  2. Sits idle — if you haven't made a sound, nothing happens.
-  3. The moment you speak and pause, the listener answers (via Groq, or
-     via the Qwen backup if Groq is down) and writes text + response into
-     chunks.json in one push.
-  4. This script's response watcher just plays back whatever "response"
-     shows up in chunks.json, same as before -- it doesn't care which
-     brain produced it.
-  5. Ctrl+C here kills the local listener and cancels the Qwen run only
-     if the fallback ever actually triggered one.
+  1. Triggers gptoss_watcher.yml and waits for it to confirm GPT-OSS 20B is
+     loaded and answering (wait_for_ready). Groq is gone entirely -- this
+     GitHub Actions watcher, running gpt-oss:20b via Ollama, is now the only
+     brain, for both tool-calling routing decisions and plain conversation.
+     There is no more lazy/reactive trigger-on-failure; it's unconditional,
+     every session, before the mic ever opens.
+  2. Starts the local mic listener (live_split_on_pauses.py) once the
+     watcher is confirmed ready.
+  3. Sits idle -- if you haven't made a sound, nothing happens.
+  4. The moment you speak and pause, the listener asks the local control
+     plane, which queues a chat-completion job in chat/Log 1/completions.json
+     (see ollama_relay.py) and blocks until the watcher answers it.
+  5. This script's response watcher plays back whatever comes through the
+     local response queue -- same playback mechanism as before, it just
+     never touches Groq now.
+  6. Ctrl+C here kills the local listener and cancels the watcher run.
 
 Setup:
-    export GH_TOKEN="your_new_token"     # repo + workflow scope
-    export GROQ_API_KEY="your_groq_key"  # primary responder, read by live_split_on_pauses.py
+    export GH_TOKEN="your_new_token"     # repo + workflow scope, used for both
+                                          # the watcher dispatch and the
+                                          # completions.json relay
 """
 
 from __future__ import annotations
@@ -35,14 +38,8 @@ import sys
 import tempfile
 import threading
 import time
-from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
-
-try:
-    import fcntl
-except ImportError:  # Windows fallback; fcntl is available on macOS/Linux.
-    fcntl = None
 
 import requests
 import edge_tts
@@ -86,7 +83,7 @@ _MARKDOWN_STRIP_RE = re.compile(r"[*_`#]+|^\s*[-•]\s+", re.MULTILINE)
 def clean_for_speech(text: str) -> str:
     """Strip markdown symbols before they get spoken as literal words
     ("asterisk", "pound sign", etc.). watch_and_respond.py already asks
-    Qwen not to produce markdown and does its own cleanup server-side --
+    GPT-OSS not to produce markdown and does its own cleanup server-side --
     this is the second line of defense, cheap insurance either way."""
     text = _MARKDOWN_STRIP_RE.sub("", text)
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
@@ -117,7 +114,7 @@ def speak_locally(text: str, tmp_name: str) -> str | None:
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
-def speak_locally_pipelined(text: str, session_start_ts: float, tmp_prefix: str = "qwen_reply"):
+def speak_locally_pipelined(text: str, session_start_ts: float, tmp_prefix: str = "gptoss_reply"):
     """Splits the reply into sentences and pipelines synth + playback:
     while sentence N is playing, sentence N+1 is already being synthesized
     on a background thread, instead of "synthesize the whole reply, then
@@ -172,7 +169,7 @@ def speak_locally_pipelined(text: str, session_start_ts: float, tmp_prefix: str 
 TOKEN = os.environ.get("GH_TOKEN")
 
 REPO = "TanishC4444/runnerTests"
-WORKFLOW_FILE = "qwen_watcher.yml"
+WORKFLOW_FILE = "gptoss_watcher.yml"
 BASE = f"https://api.github.com/repos/{REPO}/actions/workflows/{WORKFLOW_FILE}"
 HEADERS = {"Accept": "application/vnd.github+json"}
 if TOKEN:
@@ -184,10 +181,8 @@ STATUS_API_URL = f"https://api.github.com/repos/{REPO}/contents/{STATUS_FILE}"
 CHUNKS_LOG_FILE = os.path.join("chat", "Log 1", "chunks.json")
 
 LISTENER_SCRIPT = "live_split_on_pauses.py"
-READY_TIMEOUT_S = 240  # generous: cold model pull + Ollama boot can be slow
-RESPONSE_POLL_SECONDS = 1.5  # git pull, not an API call -- safe to poll tighter
+READY_TIMEOUT_S = 480  # generous: a cold gpt-oss:20b pull (~14GB) plus Ollama boot can genuinely take minutes
 LOCAL_RESPONSE_POLL_SECONDS = 0.1
-GIT_LOCK_FILE = os.path.join(tempfile.gettempdir(), "runnerTests_git_sync.lock")
 
 # Same path live_split_on_pauses.py writes to. Local-only IPC, never touches
 # Git -- this is what makes barge-in and the dashboard possible without
@@ -221,23 +216,13 @@ def _write_local_status(**fields):
         pass
 
 
-@contextmanager
-def git_sync_lock():
-    """Serialize Git operations with the microphone subprocess."""
-    with open(GIT_LOCK_FILE, "a+") as lock_file:
-        if fcntl is not None:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            if fcntl is not None:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-
-def trigger_workflow():
-    resp = requests.post(f"{BASE}/dispatches", headers=HEADERS, json={"ref": "main"})
+def trigger_workflow(session_id: str | None = None):
+    payload = {"ref": "main"}
+    if session_id:
+        payload["inputs"] = {"session_id": session_id}
+    resp = requests.post(f"{BASE}/dispatches", headers=HEADERS, json=payload)
     resp.raise_for_status()
-    print("[cloud] workflow triggered.")
+    print("[cloud] gptoss_watcher.yml triggered.")
 
 
 def get_latest_run_id():
@@ -523,7 +508,7 @@ def wait_for_ready(timeout_s: int = READY_TIMEOUT_S):
     Prints an elapsed-time heartbeat every 15s -- the wait can legitimately
     take a couple minutes (Ollama install + model load on a CPU-only
     runner), and a silent wait is indistinguishable from a stuck one."""
-    print("[cloud] waiting for Qwen to finish loading...")
+    print("[cloud] waiting for GPT-OSS 20B to finish loading...")
     start = time.time()
     deadline = start + timeout_s
     last_heartbeat = start
@@ -532,11 +517,11 @@ def wait_for_ready(timeout_s: int = READY_TIMEOUT_S):
         if payload and payload.get("error"):
             raise RuntimeError(payload["error"])
         if payload and payload.get("ready"):
-            tmp_path = speak_locally("I'm ready, go ahead.", "qwen_ready.mp3")
+            tmp_path = speak_locally("I'm ready, go ahead.", "gptoss_ready.mp3")
             if tmp_path:
                 play_audio_interruptible(tmp_path, session_start_ts=time.time())
             else:
-                print("[cloud] Qwen is ready (local TTS unavailable, text-only).")
+                print("[cloud] GPT-OSS is ready (local TTS unavailable, text-only).")
             return
         now = time.time()
         if now - last_heartbeat >= 15:
@@ -545,7 +530,7 @@ def wait_for_ready(timeout_s: int = READY_TIMEOUT_S):
             last_heartbeat = now
         time.sleep(2)
     raise RuntimeError(
-        "Timed out waiting for Qwen to pass its model warm-up; the microphone was not started."
+        "Timed out waiting for GPT-OSS to pass its model warm-up; the microphone was not started."
     )
 
 
@@ -562,7 +547,8 @@ def load_chunks():
 def load_local_responses() -> list[dict]:
     """Read primary replies queued directly by the microphone process.
 
-    This local path makes Groq speech independent of Git synchronization.
+    This local path lets the microphone process speak a reply the moment
+    it has one, without waiting on this process's own Git-polling loop.
     The queue is session-scoped and response_watcher_loop de-duplicates it
     against the durable chunks log using the chunk datetime/response ID.
     """
@@ -645,34 +631,28 @@ def gptoss_completion_watcher(stop_event: threading.Event, control_plane: Contro
         stop_event.wait(GPTOSS_POLL_SECONDS)
 
 
-def git_pull_quiet():
-    """Best-effort pull -- if it fails (e.g. a lock held by the listener's
-    own concurrent pull), just skip this cycle and try again shortly."""
-    try:
-        with git_sync_lock():
-            subprocess.run(
-                ["git", "pull", "--rebase", "--autostash"],
-                capture_output=True, timeout=20,
-            )
-    except Exception:
-        pass
 
 
 def response_watcher_loop(stop_event: threading.Event, control_plane: ControlPlane):
-    """Speak primary local replies and backup replies from chunks.json.
+    """Speak replies as they land in the local response queue.
 
-    Both paths use speak_locally_pipelined, whose player checks microphone
-    state every BARGE_IN_POLL_S, so either model can be interrupted. Primary
-    replies arrive through a local queue and do not wait for Git; the response
-    ID prevents the durable remote copy from being spoken a second time.
+    Every reply -- whether it came from the control-plane's tool-calling
+    router or local_responder.py's plain-conversation fallback -- ultimately
+    came from the same gptoss_watcher.yml relay and lands here the same way.
+    There is no more separate "backup" transport to poll: chunks.json is
+    still written as a durable transcript log (see live_split_on_pauses.py)
+    but nothing writes a remote "response" into it anymore, so polling it
+    for answers here would just never find any.
+
+    speak_locally_pipelined's player checks microphone state every
+    BARGE_IN_POLL_S, so a reply can always be interrupted by you talking
+    over it.
     """
     # seed with anything already answered from a previous session so we
     # don't replay old responses on startup
     played = {e.get("datetime") for e in load_chunks() if "response" in e}
-    next_remote_poll = 0.0
 
     while not stop_event.is_set():
-        # Primary Groq replies take the direct local path for minimum latency.
         for event in load_local_responses():
             key = event["response_id"]
             if key in played:
@@ -680,38 +660,15 @@ def response_watcher_loop(stop_event: threading.Event, control_plane: ControlPla
             played.add(key)
 
             reply = event["text"]
-            print(f"[talkback:groq] {reply[:60]!r}")
-            control_plane.usage.add("qwen/qwen3.6-27b", event.get("usage"))
+            print(f"[talkback] {reply[:60]!r}")
+            control_plane.usage.add("gpt-oss:20b", event.get("usage"))
             _write_local_status(
                 conv_state="speaking", conv_state_ts=time.time(), last_reply_text=reply
             )
-            speak_locally_pipelined(reply, session_start_ts=time.time(), tmp_prefix="groq_reply")
+            speak_locally_pipelined(reply, session_start_ts=time.time(), tmp_prefix="gptoss_reply")
             _write_local_status(conv_state="idle", conv_state_ts=time.time())
             if event.get("user_text") and not event.get("logged"):
                 control_plane.record_voice_turn(event["user_text"], reply)
-
-        # Backup responses still arrive through the durable remote log, but
-        # keep its slower Git polling separate from the 100ms local queue.
-        if time.monotonic() >= next_remote_poll:
-            git_pull_quiet()
-            for entry in load_chunks():
-                key = entry.get("datetime")
-                if key in played or "response" not in entry:
-                    continue
-                played.add(key)
-
-                reply = entry.get("response", "")
-                print(f"[talkback:qwen-backup] {reply[:60]!r}")
-                _write_local_status(
-                    conv_state="speaking", conv_state_ts=time.time(), last_reply_text=reply
-                )
-
-                speak_locally_pipelined(reply, session_start_ts=time.time())
-
-                _write_local_status(conv_state="idle", conv_state_ts=time.time())
-                if entry.get("text"):
-                    control_plane.record_voice_turn(entry["text"], reply, model="qwen2.5:3b-backup")
-            next_remote_poll = time.monotonic() + RESPONSE_POLL_SECONDS
 
         stop_event.wait(LOCAL_RESPONSE_POLL_SECONDS)
 
@@ -727,24 +684,26 @@ def main():
     control_plane = ControlPlane()
     start_dashboard_server(control_plane)
 
-    # Reset any stale "ready" flag from a previous session so that if the
-    # Qwen fallback does get triggered later, wait_for_ready-style checks
-    # elsewhere don't mistake an old signal for a fresh one. Best-effort --
-    # a failure here shouldn't block starting the mic.
+    # Reset any stale "ready" flag from a previous session so wait_for_ready
+    # below can't mistake an old signal for this session's watcher.
     try:
         reset_status()
     except Exception as e:
         print(f"[cloud] could not reset status.json (continuing anyway): {e}")
 
-    # Tag every chunk and any lazily-dispatched backup run with the same
-    # session ID. This lets a newly booted watcher distinguish the unanswered
-    # chunk that launched it from stale, pre-existing conversation history.
     session_id = str(time.time_ns())
     _write_local_status(session_id=session_id)
 
-    # No pre-trigger, no wait-for-ready: Groq answers directly, so the mic
-    # starts immediately. live_split_on_pauses.py triggers qwen_watcher.yml
-    # itself, only if/when Groq actually fails.
+    # Groq is gone -- gptoss_watcher.yml (GPT-OSS 20B via Ollama) is the only
+    # brain now, so it has to be up and confirmed answering before the mic
+    # opens. This is a real, felt wait every session (cold Ollama install +
+    # model pull can take minutes on a fresh runner, faster once the model
+    # cache is warm) -- there's no more "Groq answers instantly, watcher is
+    # just a rare backup" shortcut.
+    print("[cloud] triggering gptoss_watcher.yml...")
+    trigger_workflow(session_id)
+    wait_for_ready()
+
     print("[local] starting mic listener...")
     listener_env = os.environ.copy()
     listener_env["RUNNER_SESSION_ID"] = session_id
@@ -777,16 +736,15 @@ def main():
                 listener.kill()
         print("[local] listener stopped.")
 
-        # Only cancel a watcher that this session actually used. Looking up
-        # and cancelling the latest workflow unconditionally can stop an
-        # unrelated/manual backup run when Groq never failed here.
-        if _read_local_status().get("qwen_fallback_triggered"):
-            try:
-                run_id = get_latest_run_id()
-                if run_id:
-                    cancel_run(run_id)
-            except Exception as e:
-                print(f"[cloud] could not check/cancel Qwen run: {e}")
+        # This session always triggered a watcher run (unconditionally, at
+        # startup), so always try to cancel it -- unlike the old lazy-backup
+        # design, there's no "did we even use it" check needed anymore.
+        try:
+            run_id = get_latest_run_id()
+            if run_id:
+                cancel_run(run_id)
+        except Exception as e:
+            print(f"[cloud] could not check/cancel the watcher run: {e}")
 
 
 if __name__ == "__main__":

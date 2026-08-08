@@ -1,0 +1,121 @@
+name: GPT-OSS Watcher
+# Triggered once at the start of every session (run_all.py does this
+# unconditionally now -- there is no more Groq primary path this is a
+# fallback for). One runner stays alive for the whole session and answers
+# every chat-completion request queued in chat/Log 1/completions.json via
+# its own poll loop -- both tool-calling routing decisions and plain
+# conversational replies land here now.
+on:
+  workflow_dispatch:
+    inputs:
+      session_id:
+        description: Session that launched this watcher
+        required: false
+        type: string
+
+# Only one coordinator watcher should ever be live. A new session's trigger
+# must win over a stale one instead of queuing behind it.
+concurrency:
+  group: gptoss-watcher
+  cancel-in-progress: true
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # stay under the 360min (6h) hard cap
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # PAT stored as a repo secret, never hardcoded
+          token: ${{ secrets.RUNNER_PAT }}
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          sudo docker image prune --all --force || true
+      - name: Install complete Ollama runtime
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama --version
+
+          echo "CPU cores visible to this runner:"
+          nproc
+          CORES=$(nproc)
+
+          sudo systemctl stop ollama 2>/dev/null || true
+
+          # Ollama's own core auto-detection can under-count inside a CI
+          # container -- pin it explicitly instead of trusting the default,
+          # and disable multi-model/parallel-request overhead we don't need
+          # for one sequential conversation (frees that memory/scheduling
+          # headroom for the single model actually in use).
+          export OLLAMA_NUM_THREAD="$CORES"
+          export OLLAMA_NUM_PARALLEL=1
+          export OLLAMA_MAX_LOADED_MODELS=1
+
+          nohup ollama serve > ollama.log 2>&1 &
+          ready=""
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:11434/api/tags > /dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ -z "$ready" ]; then
+            echo "::error::Ollama server never became reachable, dumping log:"
+            cat ollama.log
+            exit 1
+          fi
+      - name: Restore GPT-OSS Ollama cache
+        id: cache-ollama
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ollama/models
+          # Same cache key agent_worker.yml uses for its own GPT-OSS pull --
+          # sharing it means whichever workflow ran most recently keeps the
+          # other one's pull warm too, instead of each maintaining its own
+          # copy of the same ~14GB model.
+          key: ollama-gpt-oss-20b-linux-v1
+        continue-on-error: true
+      - name: Verify/pull GPT-OSS 20B
+        run: |
+          ollama pull gpt-oss:20b
+      - name: Save GPT-OSS Ollama cache
+        if: steps.cache-ollama.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ollama/models
+          key: ollama-gpt-oss-20b-linux-v1
+        continue-on-error: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements-runner.txt
+      - name: Install Python deps
+        run: |
+          pip install -r requirements-runner.txt
+          python -c "import requests; print('requests', requests.__version__)"
+      - name: Run watcher loop
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          RUNNER_SESSION_ID: ${{ inputs.session_id }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -o pipefail
+          dump_ollama_log() {
+            code=$?
+            if [ "$code" -ne 0 ]; then
+              echo "::group::Ollama server log"
+              cat ollama.log || true
+              echo "::endgroup::"
+            fi
+            exit "$code"
+          }
+          trap dump_ollama_log EXIT
+          python -u watch_and_respond.py

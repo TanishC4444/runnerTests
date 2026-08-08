@@ -9,7 +9,8 @@
     "max_file_bytes": 262144
   },
   "models": {
-    "tool_router": "qwen/qwen3.6-27b",
+    "tool_router": "gpt-oss:20b",
+    "tool_router_workflow": "gptoss_watcher.yml",
     "background_worker": "gpt-oss:20b",
     "background_workflow": "agent_worker.yml"
   },
