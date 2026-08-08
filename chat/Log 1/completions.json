@@ -6956,5 +6956,24 @@
     "max_tokens": 2000,
     "temperature": 0.2,
     "num_ctx": 131072
+  },
+  {
+    "request_id": "7b55ec15cb9e4792bfcfdb98b1b01784",
+    "created_at": 1786212631.592057,
+    "model": "gpt-oss:20b",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a voice assistant. Reply in plain spoken English only: full sentences, normal punctuation, no markdown, no asterisks, no bullet points, no headers, no code fences. Someone is going to hear this read aloud, not read it on a screen. Keep replies conversational and reasonably brief."
+      },
+      {
+        "role": "user",
+        "content": "How are you"
+      }
+    ],
+    "reasoning_effort": "low",
+    "max_tokens": 200,
+    "temperature": 0.7,
+    "num_ctx": 131072
   }
 ]
