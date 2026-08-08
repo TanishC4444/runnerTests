@@ -6998,6 +6998,18 @@
     "reasoning_effort": "low",
     "max_tokens": 200,
     "temperature": 0.7,
-    "num_ctx": 131072
+    "num_ctx": 131072,
+    "response": {
+      "message": {
+        "role": "assistant",
+        "content": "I\u2019m doing well, thank you! How can I help you today?",
+        "thinking": "We have a user: \"How are you\". We need to respond as a voice assistant, plain spoken English, full sentences, normal punctuation, no markdown or bullet points. Conversational and briefly. So simple reply: \"I'm good, thanks for asking. How can I help you today?\" That's it."
+      },
+      "usage": {
+        "prompt_tokens": 140,
+        "completion_tokens": 87,
+        "total_tokens": 227
+      }
+    }
   }
 ]
