@@ -554,5 +554,13 @@
     "raw_text": "i am meeting",
     "session_id": "1786154261593321000",
     "response": "Understood. Let me know when you're ready to continue."
+  },
+  {
+    "datetime": "2026-08-07T20:57:53.992074",
+    "talk_seconds": 0.48,
+    "text": "understood",
+    "raw_text": "understood",
+    "session_id": "1786154261593321000",
+    "response": "Ready when you are."
   }
 ]
