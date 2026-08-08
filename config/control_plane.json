@@ -15,7 +15,7 @@
     "background_workflow": "agent_worker.yml"
   },
   "safeguards": {
-    "require_approval_for_writes": false,
+    "require_approval_for_writes": true,
     "deny_destructive_tools": true,
     "approval_ttl_seconds": 900
   },
