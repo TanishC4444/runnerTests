@@ -482,5 +482,13 @@
     "raw_text": "skills like",
     "session_id": "1786150335876294000",
     "response": "The tools work by making API calls to GitHub. Here's how:\n\n1. **Authentication**: Each tool uses your GitHub token to authenticate requests.\n\n2. **Read Operations**:\n   - `github_list_repositories`: Fetches all repos you have access to\n   - `github_get_repository`: Gets details for a specific repo\n   - `github_list_repo_files`: Lists files/folders in a directory\n   - `github_get_file`: Reads a file's content\n   - `github_list_workflow_runs`: Shows recent workflow runs\n   - `github_list_runners`: Lists self-hosted runners\n\n3. **Write Operations**:\n   - `github_create_folder`: Creates a folder by adding a .gitkeep file\n   - `github_put_file`: Creates or updates a file with given content\n\n4. **Delegation**:\n   - `delegate_to_gpt"
+  },
+  {
+    "datetime": "2026-08-07T19:55:39.519535",
+    "talk_seconds": 3.24,
+    "text": "How do you make tools and then what do they connect to and how can I spend them for you",
+    "raw_text": "how do you make tools and then what are they connect to and how can i spend them for you",
+    "session_id": "1786150335876294000",
+    "response": "Routing failed: Groq planner failed with HTTP 429: {\"error\":{\"message\":\"Rate limit reached for model `qwen/qwen3.6-27b` in organization `org_01kbs1pwysfrev2qgn9w3ywasd` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Used 7357, Requested 2153. Please try again in 11.325s. Need more tokens? Upgrade to Dev Tier today at https://console.groq.com/settings/billing\",\"type\":\"tokens\",\"code\":\"rate_limit_exceeded\"}}"
   }
 ]
