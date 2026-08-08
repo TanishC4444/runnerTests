@@ -570,13 +570,20 @@ class MCPRegistry:
             raise ControlPlaneError(f"MCP tool failed: {payload['error']}")
         return payload.get("result", {})
 
-    def _is_read_only(self, qualified_name: str) -> bool:
-        if qualified_name.startswith("mcp__"):
-            return self.mcp.is_read_only(qualified_name)
-        try:
-            return not self.github.spec(qualified_name).write
-        except ControlPlaneError:
+    def is_read_only(self, qualified_name: str) -> bool:
+        parts = qualified_name.split("__", 2)
+        if len(parts) != 3 or parts[0] != "mcp":
             return False
+        _, server, tool_name = parts
+        cfg = self.config.get(server, {})
+        if cfg.get("read_only"):
+            return True
+        try:
+            tools = self.list_tools(server)
+        except Exception:
+            return False
+        tool = next((t for t in tools if t["name"] == tool_name), None)
+        return bool(tool and tool.get("annotations", {}).get("readOnlyHint"))
 
 
 class SkillRegistry:
@@ -850,6 +857,15 @@ class ModelRouter:
                     "read_only": bool(cfg.get("read_only")) or bool(tool.get("annotations", {}).get("readOnlyHint")),
                 })
         return {"skills": skills, "mcp_tools": mcp_tools, "mcp_servers": mcp_servers}
+
+    def _is_read_only(self, name: str) -> bool:
+        if name.startswith("mcp__"):
+            return self.mcp.is_read_only(name)
+        try:
+            return not self.github.spec(name).write
+        except ControlPlaneError:
+            return False
+
 
     # Caps how many tool calls the model can chain in a single turn before it
     # must produce an answer. Each step is a full relay round trip (queue a
