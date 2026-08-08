@@ -369,6 +369,29 @@
           }
         }
       }
-    ]
+    ],
+    "response": {
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "reasoning": "Need list repos.",
+        "tool_calls": [
+          {
+            "id": "call_cn8mzlab",
+            "index": 0,
+            "type": "function",
+            "function": {
+              "name": "github_list_repositories",
+              "arguments": "{}"
+            }
+          }
+        ]
+      },
+      "usage": {
+        "prompt_tokens": 1179,
+        "completion_tokens": 26,
+        "total_tokens": 1205
+      }
+    }
   }
 ]
