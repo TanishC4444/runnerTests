@@ -50,7 +50,6 @@ import base64
 import json
 import os
 import queue
-import re
 import sys
 import tempfile
 import threading
@@ -244,27 +243,7 @@ def append_remote_chunk(entry: dict):
     raise RuntimeError("chunk append kept conflicting after all retries")
 
 
-# Spoken mute/unmute is deliberately a *different* mechanism from the
-# keyboard/dashboard `muted` Event below. That one stops webrtcvad/Vosk from
-# running at all -- cheap, but it also means it can never hear you say
-# "unmute" while it's active. This one keeps transcription running as normal
-# and just short-circuits inside the worker thread: nothing gets sent to
-# Groq/the control plane, and no tokens get spent, but the phrase itself is
-# always heard. Word-boundary regex, not a plain substring check -- "mut" as
-# a bare substring also matches "commute", "immutable", "mutual", etc.
-_UNMUTE_RE = re.compile(r"\bun[\s-]?mut(?:e|ing)\b")
-_MUTE_RE = re.compile(r"\bmut(?:e|ing)\b")
-
-
-def _mute_command(lowered_text: str) -> str | None:
-    if _UNMUTE_RE.search(lowered_text):
-        return "unmute"
-    if _MUTE_RE.search(lowered_text):
-        return "mute"
-    return None
-
-
-def worker_loop(work_q: "queue.Queue", tool, t_start: float, voice_muted: threading.Event):
+def worker_loop(work_q: "queue.Queue", tool, t_start: float):
     """Runs on a background thread: does the slow stuff (grammar correction,
     remote append, and printing) so the mic-reading loop never waits on it."""
     pending = []
@@ -277,27 +256,6 @@ def worker_loop(work_q: "queue.Queue", tool, t_start: float, voice_muted: thread
         elapsed = now - t_start
 
         fixed = correct(raw_text, tool)
-        command = _mute_command(fixed.lower())
-        if command == "mute" and not voice_muted.is_set():
-            voice_muted.set()
-            print(f"[t={fmt(elapsed)}] [voice] muted -- say \"unmute\" to resume")
-            _write_local_status(mic_state="muted", mic_state_ts=time.time())
-            _queue_local_response(f"mute-{now}", "Muted.", "")
-            continue
-        if command == "unmute" and voice_muted.is_set():
-            voice_muted.clear()
-            print(f"[t={fmt(elapsed)}] [voice] unmuted")
-            _write_local_status(mic_state="listening", mic_state_ts=time.time(), conv_state="idle")
-            _queue_local_response(f"unmute-{now}", "Unmuted.", "")
-            continue
-        if voice_muted.is_set():
-            # Heard something, but we're voice-muted and it wasn't "unmute" --
-            # drop it before it costs a single token. Local transcription
-            # keeps running underneath so the next "unmute" still lands.
-            if SHOW_PARTIAL_PREVIEW:
-                sys.stdout.write("\r" + " " * 80 + "\r")
-            continue
-
         tag = "  (corrected)" if fixed != raw_text else ""
 
         if SHOW_PARTIAL_PREVIEW:
@@ -392,17 +350,15 @@ def live_split():
     _write_local_status(mic_state="listening", mic_state_ts=time.time(), conv_state="idle")
     print(f"Publishing to {LOG_FILE} ({len(entries)} entries in local mirror)")
     print(f"Listening... a {PAUSE_MS}ms pause ends a chunk. Ctrl+C to stop.")
-    print("Type 'm' + Enter at any time to mute/unmute. Saying \"I am muting\"/\"I am unmuting\" works too.\n")
+    print("Type 'm' + Enter at any time to mute/unmute.\n")
 
     t_start = time.perf_counter()
     t_last_chunk = t_start
 
-    voice_muted = threading.Event()  # spoken mute -- see _mute_command above
-
     work_q: "queue.Queue" = queue.Queue()
     worker = threading.Thread(
         target=worker_loop,
-        args=(work_q, tool, t_start, voice_muted),
+        args=(work_q, tool, t_start),
         daemon=True,
     )
     worker.start()
