@@ -666,7 +666,14 @@ class ModelRouter:
 
     def _messages(self, text: str, history: list[dict], skills: list[dict]) -> list[dict]:
         skill_text = "\n".join(f"- {skill['title']}: {skill.get('instructions', '')}" for skill in skills)
+        # Brevity comes first and is unconditional -- every extra word here is
+        # extra prompt tokens on every single turn, and short replies cost
+        # fewer completion tokens too. Both count against Groq's per-minute
+        # token limit for this model, so this line is the main lever against
+        # rate-limit errors, not a style preference.
         system = (
+            "Reply in as few words as possible -- one or two short sentences unless the user "
+            "explicitly asks for more. No filler, no restating the question, no hedging.\n\n"
             "You are the always-available Qwen coordinator and conversational assistant. "
             "Use read tools immediately when they can answer or discover missing facts. "
             "For engineering work delegated to GPT-OSS, ask only high-impact questions whose answers "
@@ -678,31 +685,36 @@ class ModelRouter:
             "the user supplied the exact content. Delegate any task requiring repository inspection, code "
             "generation, multiple edits, debugging, or tests. For new repositories, never choose visibility, "
             "README initialization, license, or gitignore on the user's behalf; ask for missing choices, combining "
-            "them into at most three concise questions. Keep every answer as short as possible while still useful.\n\nActive skills:\n"
+            "them into at most three concise questions.\n\nActive skills:\n"
             + (skill_text or "- Conversation only")
         )
         messages = [{"role": "system", "content": system}]
-        for item in history[-16:]:
+        # Trimmed from 16 messages / 6000 chars each: that ceiling alone could
+        # add ~24k prompt tokens before the tool schemas or this turn's text
+        # are even counted -- easily enough on its own to blow an 8k/minute cap.
+        for item in history[-8:]:
             if item.get("kind") == "message" and item.get("role") in ("user", "assistant"):
-                messages.append({"role": item["role"], "content": str(item.get("content", ""))[:6000]})
+                messages.append({"role": item["role"], "content": str(item.get("content", ""))[:1500]})
         if not messages or messages[-1].get("content") != text:
             messages.append({"role": "user", "content": text})
         return messages
 
     @staticmethod
     def token_budget(text: str, history: list[dict]) -> int:
-        """Give short turns small ceilings and reserve space for real plans."""
+        """Give short turns small ceilings and reserve space for real plans.
+        Lowered across the board -- these are hard caps on completion tokens,
+        the other lever (besides prompt size) against the per-minute limit."""
         lowered = text.lower()
         planning = any(word in lowered for word in ("implement", "build", "refactor", "debug", "fix", "plan", "script"))
         reading = any(word in lowered for word in ("list", "show", "read", "status", "latest", "what", "which"))
         followup = len(text.split()) <= 20 and len(history) >= 2
         if planning:
-            return 750
+            return 500
         if reading:
-            return 320
+            return 220
         if followup:
-            return 180
-        return 240
+            return 120
+        return 160
 
     def _tools_for_skills(self, selected_skills: list[dict]) -> list[dict]:
         """Only send Groq the tools the matched skills actually declare.
@@ -742,6 +754,26 @@ class ModelRouter:
             tools.append(self._delegation_tool())
         return tools
 
+    # Caps how many tool calls the model can chain in a single turn before it
+    # must produce an answer. Each step is a full Groq round trip, so this
+    # bounds worst-case token/latency cost, not just infinite-loop risk.
+    MAX_TOOL_STEPS = 4
+
+    def _is_safe_to_chain(self, name: str) -> bool:
+        """Only tools that need no human approval can execute mid-loop.
+        Writes, delegation, and non-read-only MCP tools always stop the loop
+        and fall through to the existing approval flow -- chaining never
+        bypasses approval, it only chains together things that already ran
+        without it."""
+        if name == "delegate_to_gptoss":
+            return False
+        if name.startswith("mcp__"):
+            return self.mcp.is_read_only(name)
+        try:
+            return not self.github.spec(name).write
+        except ControlPlaneError:
+            return False
+
     def route(self, text: str, history: list[dict], voice: bool = False) -> dict:
         key = os.environ.get("GROQ_API_KEY")
         if not key:
@@ -753,39 +785,56 @@ class ModelRouter:
         )
         selected_skills = self.skills.select(skill_context)
         tools = self._tools_for_skills(selected_skills)
-        request_body = {
-            "model": model,
-            "messages": self._messages(text, history, selected_skills),
-            "reasoning_effort": "none",
-            "temperature": 0.2,
-            "max_tokens": self.token_budget(text, history),
-        }
-        if tools:
-            request_body["tools"] = tools
-            request_body["tool_choice"] = "auto"
-        response = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            json=request_body,
-            timeout=30,
-        )
-        if not response.ok:
-            raise ControlPlaneError(f"Groq planner failed with HTTP {response.status_code}: {response.text[:500]}")
-        payload = response.json()
-        self.usage.add(model, payload.get("usage"))
-        message = payload["choices"][0]["message"]
-        calls = message.get("tool_calls") or []
-        if not calls:
-            return {"type": "message", "text": message.get("content") or "I need more detail before choosing a GitHub tool.", "model": model}
-        call = calls[0]
-        try:
-            arguments = json.loads(call["function"].get("arguments") or "{}")
-        except json.JSONDecodeError as e:
-            raise ControlPlaneError(f"The model produced invalid tool arguments: {e}")
-        name = call["function"]["name"]
-        if voice and name.startswith("mcp__") and not self.mcp.is_read_only(name):
-            return {"type": "message", "text": "That MCP action is not read-only, so I need you to use the dashboard approval flow.", "model": model}
-        return {"type": "tool", "name": name, "arguments": arguments, "model": model}
+        messages = self._messages(text, history, selected_skills)
+
+        for _ in range(self.MAX_TOOL_STEPS):
+            request_body = {
+                "model": model,
+                "messages": messages,
+                "reasoning_effort": "none",
+                "temperature": 0.2,
+                "max_tokens": self.token_budget(text, history),
+            }
+            if tools:
+                request_body["tools"] = tools
+                request_body["tool_choice"] = "auto"
+            response = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json=request_body,
+                timeout=30,
+            )
+            if not response.ok:
+                raise ControlPlaneError(f"Groq planner failed with HTTP {response.status_code}: {response.text[:500]}")
+            payload = response.json()
+            self.usage.add(model, payload.get("usage"))
+            message = payload["choices"][0]["message"]
+            calls = message.get("tool_calls") or []
+            if not calls:
+                return {"type": "message", "text": message.get("content") or "I need more detail before choosing a GitHub tool.", "model": model}
+            call = calls[0]
+            try:
+                arguments = json.loads(call["function"].get("arguments") or "{}")
+            except json.JSONDecodeError as e:
+                raise ControlPlaneError(f"The model produced invalid tool arguments: {e}")
+            name = call["function"]["name"]
+            if voice and name.startswith("mcp__") and not self.mcp.is_read_only(name):
+                return {"type": "message", "text": "That MCP action is not read-only, so I need you to use the dashboard approval flow.", "model": model}
+            if not self._is_safe_to_chain(name):
+                return {"type": "tool", "name": name, "arguments": arguments, "model": model}
+
+            # Safe read: run it now and hand the result back to the same
+            # model call instead of stopping the turn, so "check X then read
+            # Y" resolves in one pass -- and so this replaces the separate
+            # summarize() round trip for the common single-tool case too.
+            try:
+                result = self.mcp.execute(name, arguments) if name.startswith("mcp__") else self.github.execute(name, arguments)
+            except Exception as e:
+                result = {"error": str(e)}
+            messages.append({"role": "assistant", "content": message.get("content"), "tool_calls": [call]})
+            messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, default=str)[:4000]})
+
+        return {"type": "message", "text": "I gathered some information but hit my per-turn tool-call limit -- ask again more specifically.", "model": model}
 
     def summarize(self, request: str, tool_name: str, result: Any) -> str:
         key = os.environ.get("GROQ_API_KEY")
