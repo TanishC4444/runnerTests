@@ -712,16 +712,21 @@ class ModelRouter:
 
     def _messages(self, text: str, history: list[dict], skills: list[dict]) -> list[dict]:
         skill_text = "\n".join(f"- {skill['title']}: {skill.get('instructions', '')}" for skill in skills)
-        # Brevity is still unconditional even though Groq's rate limit is gone
-        # (this now runs on a locally-hosted gpt-oss:20b Actions watcher, not a
-        # metered cloud API) -- fewer completion tokens means less time spent
-        # generating on CPU-only Actions hardware, which is the real
-        # bottleneck now: latency, not a token ceiling.
+        # Brevity used to be unconditional here because every prompt token
+        # and every history message fed straight into Groq's per-minute rate
+        # limit. That ceiling is gone -- gpt-oss:20b runs locally on the
+        # Actions watcher against its own ~128k context window (see
+        # GPTOSS_NUM_CTX in ollama_relay.py / watch_and_respond.py), so the
+        # real constraint now is CPU-only generation speed, not prompt size.
+        # Voice replies still ask for brevity below (spoken answers should
+        # stay short regardless of budget), but that's a style instruction,
+        # not a token-starvation workaround.
         system = (
-            "Reply in as few words as possible -- one or two short sentences unless the user "
-            "explicitly asks for more. No filler, no restating the question, no hedging. Plain "
-            "spoken language only, never markdown (no asterisks, headers, bullets, or code fences) "
-            "-- this is often read aloud.\n\n"
+            "Keep spoken/chat replies concise and natural -- a sentence or two for simple things "
+            "-- but give full, complete answers whenever the user asks for detail, a plan, code, or "
+            "an explanation; do not truncate or artificially shorten those. No filler, no restating "
+            "the question, no hedging. Plain spoken language only, never markdown (no asterisks, "
+            "headers, bullets, or code fences) -- this is often read aloud.\n\n"
             "You are the always-available GPT-OSS coordinator and conversational assistant. "
             "Use read tools immediately when they can answer or discover missing facts. "
             "For engineering work delegated to GPT-OSS, ask only high-impact questions whose answers "
@@ -737,32 +742,47 @@ class ModelRouter:
             + (skill_text or "- Conversation only")
         )
         messages = [{"role": "system", "content": system}]
-        # Trimmed from 16 messages / 6000 chars each: that ceiling alone could
-        # add ~24k prompt tokens before the tool schemas or this turn's text
-        # are even counted -- easily enough on its own to blow an 8k/minute cap.
-        for item in history[-8:]:
+        # Was trimmed to the last 8 messages / 1500 chars each to protect an
+        # 8k/minute Groq cap. gpt-oss:20b's own context window (~128k tokens,
+        # roughly ~500k characters) is the only real ceiling now, and the
+        # full history plus tool schemas plus this turn's text is nowhere
+        # close to that in normal use -- so keep effectively the whole
+        # session and let individual messages run long.
+        for item in history[-200:]:
             if item.get("kind") == "message" and item.get("role") in ("user", "assistant"):
-                messages.append({"role": item["role"], "content": str(item.get("content", ""))[:1500]})
+                messages.append({"role": item["role"], "content": str(item.get("content", ""))[:20000]})
         if not messages or messages[-1].get("content") != text:
             messages.append({"role": "user", "content": text})
         return messages
 
     @staticmethod
     def token_budget(text: str, history: list[dict]) -> int:
-        """Give short turns small ceilings and reserve space for real plans.
-        Lowered across the board -- these are hard caps on completion tokens,
-        the other lever (besides prompt size) against the per-minute limit."""
+        """Completion-token ceilings, sized against gpt-oss:20b's real
+        capacity now instead of a Groq per-minute quota. These are generous
+        upper bounds, not targets -- the system prompt still asks for
+        concise spoken replies for simple turns, so most responses land far
+        under their ceiling. Planning/delegation turns get the most room
+        since a real engineering plan can legitimately need it.
+
+        Note the actual cost of raising these: CPU-only generation on an
+        Actions runner slows sharply as more context/output is used (roughly
+        9 tok/s at the far end of a 128k-context call vs. 100+ tok/s at a
+        few thousand tokens). A 6000-token ceiling that's actually used in
+        full can take several minutes to generate -- see
+        ollama_relay.timeout_s / watch_and_respond.GENERATE_TIMEOUT_S, which
+        were raised to match.
+        """
         lowered = text.lower()
         planning = any(word in lowered for word in ("implement", "build", "refactor", "debug", "fix", "plan", "script"))
         reading = any(word in lowered for word in ("list", "show", "read", "status", "latest", "what", "which"))
         followup = len(text.split()) <= 20 and len(history) >= 2
         if planning:
-            return 500
+            return 6000
         if reading:
-            return 220
+            return 3000
         if followup:
-            return 120
-        return 160
+            return 800
+        return 1500
 
     def _tools_for_skills(self, selected_skills: list[dict]) -> list[dict]:
         """Trim the tool catalog per turn instead of shipping every enabled
@@ -833,9 +853,10 @@ class ModelRouter:
 
     # Caps how many tool calls the model can chain in a single turn before it
     # must produce an answer. Each step is a full relay round trip (queue a
-    # job, wait for the GH Actions watcher to answer) -- this bounds
-    # worst-case latency, not just infinite-loop risk.
-    MAX_TOOL_STEPS = 4
+    # job, wait for the GH Actions watcher to answer). Raised from 4 now that
+    # the ceiling isn't protecting a shared cloud quota -- this exists purely
+    # as an infinite-loop backstop, so it can afford to be generous.
+    MAX_TOOL_STEPS = 40
 
     def _is_safe_to_chain(self, name: str) -> bool:
         """Only tools that need no human approval can execute mid-loop.
@@ -901,7 +922,11 @@ class ModelRouter:
             except Exception as e:
                 result = {"error": str(e)}
             messages.append({"role": "assistant", "content": message.get("content"), "tool_calls": [call]})
-            messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, default=str)[:4000]})
+            # Was truncated to 4000 chars to protect prompt-token budget under
+            # Groq. gpt-oss:20b's ~128k context has room for full tool
+            # results in the vast majority of cases -- only clip at a size
+            # that would otherwise dominate the whole context window.
+            messages.append({"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result, default=str)[:120000]})
 
         return {"type": "message", "text": "I gathered some information but hit my per-turn tool-call limit -- ask again more specifically.", "model": model}
 
@@ -909,13 +934,13 @@ class ModelRouter:
         model = self.config["tool_router"]
         messages = [
             {"role": "system", "content": "Summarize this read-only tool result as briefly as possible while fully answering the request. Use only supplied facts, plain spoken language, and no markdown."},
-            {"role": "user", "content": json.dumps({"request": request, "tool": tool_name, "result": result}, default=str)[:20000]},
+            {"role": "user", "content": json.dumps({"request": request, "tool": tool_name, "result": result}, default=str)[:120000]},
         ]
         try:
             completion = ollama_relay.request_completion(
                 model=model,
                 messages=messages,
-                max_tokens=180 if len(request.split()) < 20 else 280,
+                max_tokens=2000 if len(request.split()) < 20 else 4000,
             )
         except ollama_relay.RelayError as e:
             raise ControlPlaneError(str(e))

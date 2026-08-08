@@ -48,11 +48,43 @@ STATUS_FILE = "chat/Log 1/status.json"
 API_URL = f"https://api.github.com/repos/{REPO}/contents/{FILE_PATH}"
 STATUS_API_URL = f"https://api.github.com/repos/{REPO}/contents/{STATUS_FILE}"
 
-OLLAMA_CHAT_URL = "http://localhost:11434/v1/chat/completions"
-MODEL = "gpt-oss:20b"
+# The OpenAI-compatible endpoint (/v1/chat/completions) does not accept
+# num_ctx, so a request here could never actually use more than whatever
+# context Ollama defaults to (8192 for gpt-oss, per an Ollama bug/floor --
+# see github.com/ollama/ollama/issues/11711). Ollama's native /api/chat
+# endpoint accepts an "options" object (num_ctx, num_predict, temperature)
+# and returns an equivalent message/tool_calls shape, so use that instead.
+OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
+# gptoss_watcher.yml bakes a `gpt-oss:20b-max` tag with num_ctx=131072
+# (gpt-oss's real max) via a Modelfile, so the model's own default context
+# is already large; NUM_CTX below is sent per-request too as a second line
+# of defense (and to make it overridable without editing the workflow).
+MODEL = os.environ.get("GPTOSS_MODEL", "gpt-oss:20b-max")
+NUM_CTX = int(os.environ.get("GPTOSS_NUM_CTX", "131072"))
 
-GENERATE_TIMEOUT_S = 280  # CPU-only runner, 20B model -- generation can be genuinely slow
+# 280s was sized for small, low-context Groq-era completions. Large
+# completions at gpt-oss:20b's full 128k context on a CPU-only runner can
+# fall to roughly 9 tok/s, so a several-thousand-token reply can genuinely
+# take 10+ minutes to generate. Sized generously rather than tightly --
+# ollama_relay.py's own timeout_s (the local machine's patience) was raised
+# to match, so a slow generation here doesn't just get abandoned as a
+# relay timeout on the other end.
+GENERATE_TIMEOUT_S = int(os.environ.get("GPTOSS_GENERATE_TIMEOUT_S", "3600"))
 POLL_SECONDS = 1.5        # git fetch is a plain subprocess call, not API-rate-limited
+
+# --- Self-relaunch: GitHub's 360-minute hard cap on hosted-runner jobs
+# cannot be raised by any workflow setting. What can be done instead is have
+# this job trigger a fresh run of itself shortly before its own
+# timeout-minutes budget runs out. gptoss_watcher.yml's concurrency group
+# (cancel-in-progress: true) already exists so a new session's dispatch
+# always wins over a stale watcher -- this reuses exactly that mechanism:
+# once the new run actually starts, GitHub cancels this one automatically,
+# so no explicit self-exit is needed here. The net effect is one unbroken
+# chain of watchers for as long as a session runs, with no manual restart.
+JOB_TIMEOUT_MINUTES = int(os.environ.get("JOB_TIMEOUT_MINUTES", "350"))  # match timeout-minutes in gptoss_watcher.yml
+RELAUNCH_MARGIN_MINUTES = 15  # dispatch the next watcher this long before the hard cutoff
+RELAUNCH_AT_S = max(60, (JOB_TIMEOUT_MINUTES - RELAUNCH_MARGIN_MINUTES) * 60)
+WORKFLOW_FILE = "gptoss_watcher.yml"
 GITHUB_TIMEOUT_S = 30
 PUSH_RETRIES = 5
 HEARTBEAT_SECONDS = 15
@@ -159,13 +191,22 @@ def clean_content(text: str) -> str:
     return text.strip()
 
 
-def run_completion(messages: list, tools: list | None, reasoning_effort: str, max_tokens: int, temperature: float) -> tuple[dict, dict]:
+def run_completion(messages: list, tools: list | None, reasoning_effort: str, max_tokens: int, temperature: float, num_ctx: int = NUM_CTX) -> tuple[dict, dict]:
     payload = {
         "model": MODEL,
         "messages": messages,
+        "stream": False,
+        # reasoning_effort isn't a native /api/chat field; gpt-oss reads its
+        # reasoning level from the system/template convention Ollama wires
+        # up for this model family, so pass it through options as well for
+        # forward-compat, and keep sending it at the top level too in case a
+        # future Ollama version reads it from there directly.
         "reasoning_effort": reasoning_effort,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
+        "options": {
+            "num_predict": max_tokens,
+            "temperature": temperature,
+            "num_ctx": num_ctx,
+        },
     }
     if tools:
         payload["tools"] = tools
@@ -174,10 +215,17 @@ def run_completion(messages: list, tools: list | None, reasoning_effort: str, ma
         detail = resp.text.strip() or "<empty response body>"
         raise RuntimeError(f"Ollama chat completion failed with HTTP {resp.status_code}: {detail[:4000]}")
     data = resp.json()
-    message = data["choices"][0]["message"]
+    message = data["message"]
     if message.get("content"):
         message["content"] = clean_content(message["content"])
-    usage = data.get("usage", {})
+    # Native /api/chat reports usage as prompt_eval_count/eval_count instead
+    # of an OpenAI-shaped usage object -- normalize so every downstream
+    # caller (control_plane.py's UsageTracker etc.) keeps working unchanged.
+    usage = {
+        "prompt_tokens": data.get("prompt_eval_count", 0),
+        "completion_tokens": data.get("eval_count", 0),
+        "total_tokens": data.get("prompt_eval_count", 0) + data.get("eval_count", 0),
+    }
     return message, usage
 
 
@@ -234,6 +282,18 @@ def announce_ready():
         print(f"[ready] failed to push status.json (continuing anyway): {e}", flush=True)
 
 
+def relaunch_watcher():
+    """Dispatch a fresh gptoss_watcher.yml run so a session survives past
+    this job's own timeout-minutes budget. Best-effort: if this fails, the
+    current watcher just keeps running until its own hard timeout -- the
+    session ends there rather than never having a chance to continue, but
+    generation isn't interrupted just because a relaunch attempt failed."""
+    url = f"https://api.github.com/repos/{REPO}/actions/workflows/{WORKFLOW_FILE}/dispatches"
+    body = {"ref": BRANCH, "inputs": {"session_id": os.environ.get("RUNNER_SESSION_ID", "")}}
+    resp = requests.post(url, headers=gh_headers(), json=body, timeout=GITHUB_TIMEOUT_S)
+    resp.raise_for_status()
+
+
 def main():
     print(f"Watching {FILE_PATH} in {REPO}, polling every {POLL_SECONDS}s...", flush=True)
 
@@ -241,8 +301,22 @@ def main():
 
     handled: set[str] = set()
     last_heartbeat = time.time()
+    job_started = time.time()
+    relaunched = False
 
     while True:
+        if not relaunched and (time.time() - job_started) >= RELAUNCH_AT_S:
+            # gptoss_watcher.yml's concurrency group (cancel-in-progress:
+            # true) cancels this run automatically once the new one starts --
+            # no need to exit here, just keep serving requests until it does.
+            print(f"[relaunch] approaching {JOB_TIMEOUT_MINUTES}min job timeout, "
+                  f"dispatching a fresh watcher run...", flush=True)
+            try:
+                relaunch_watcher()
+                relaunched = True
+                print("[relaunch] dispatched successfully; this run keeps serving until superseded.", flush=True)
+            except Exception as e:
+                print(f"[relaunch] dispatch failed, will retry next poll: {e}", flush=True)
         try:
             entries, _sha = fetch_file()
         except Exception as e:
@@ -269,8 +343,9 @@ def main():
                     entry.get("messages", []),
                     entry.get("tools"),
                     entry.get("reasoning_effort", "low"),
-                    entry.get("max_tokens", 300),
+                    entry.get("max_tokens", 4000),
                     entry.get("temperature", 0.2),
+                    entry.get("num_ctx", NUM_CTX),
                 )
                 print(f"  [timing] generate={time.time() - t0:.2f}s -> "
                       f"{'tool_call' if message.get('tool_calls') else (message.get('content') or '')[:60]!r}", flush=True)

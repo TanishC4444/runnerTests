@@ -15,7 +15,10 @@ timeout elapses. That is a real, felt latency cost compared to a direct
 Groq call -- there is no way around a git-relay round trip taking multiple
 seconds at minimum, and gpt-oss:20b generating on a GitHub-hosted CPU
 runner (no GPU) on top of that. This trade removes Groq's per-minute token
-ceiling entirely; it does not make a single turn faster.
+ceiling entirely; it does not make a single turn faster -- if anything,
+pushing max_tokens/num_ctx up (see GPTOSS_NUM_CTX below) makes slow turns
+slower, since CPU-only generation drops toward ~9 tok/s at the far end of
+gpt-oss:20b's 128k context. timeout_s is sized generously to absorb that.
 """
 
 from __future__ import annotations
@@ -34,6 +37,12 @@ FILE_PATH = "chat/Log 1/completions.json"
 API_URL = f"https://api.github.com/repos/{REPO}/contents/{FILE_PATH}"
 GITHUB_TIMEOUT_S = 30
 PUSH_RETRIES = 8
+
+# gpt-oss:20b's real context window (131072 tokens via YaRN). Baked into the
+# `gpt-oss:20b-max` model tag the workflows create (see gptoss_watcher.yml /
+# agent_worker.yml) and also sent per-request here as a second line of
+# defense for whichever endpoint watch_and_respond.py is using.
+GPTOSS_NUM_CTX = int(os.environ.get("GPTOSS_NUM_CTX", "131072"))
 
 
 class RelayError(RuntimeError):
@@ -100,9 +109,15 @@ def request_completion(
     messages: list[dict],
     tools: list[dict] | None = None,
     reasoning_effort: str = "low",
-    max_tokens: int = 300,
+    max_tokens: int = 4000,
     temperature: float = 0.2,
-    timeout_s: int = 240,
+    num_ctx: int = GPTOSS_NUM_CTX,
+    # 240s was sized for small (~300 token) Groq-era completions. A
+    # multi-thousand-token completion at large context on a CPU-only runner
+    # can genuinely take tens of minutes -- this timeout is the local
+    # machine's patience for a single relay round trip, not a generation
+    # speed control, so it's set generously rather than tightly.
+    timeout_s: int = 1800,
     poll_s: float = 2.0,
 ) -> dict:
     """Queue one chat-completion job for the gpt-oss watcher and block until
@@ -119,6 +134,7 @@ def request_completion(
         "reasoning_effort": reasoning_effort,
         "max_tokens": max_tokens,
         "temperature": temperature,
+        "num_ctx": num_ctx,
     }
     if tools:
         entry["tools"] = tools

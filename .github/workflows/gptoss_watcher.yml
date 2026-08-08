@@ -22,7 +22,14 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 350   # stay under the 360min (6h) hard cap
+    # 360 minutes (6h) is a hard cap GitHub enforces on hosted runners --
+    # no workflow setting can raise it. 350 leaves headroom for this job to
+    # actually finish its steps before being force-killed at 360. What makes
+    # a session's *total* runtime unbounded is watch_and_respond.py
+    # dispatching a fresh run of this same workflow ~15 minutes before this
+    # timeout, so the chain of watchers just keeps handing off -- see
+    # RELAUNCH_AT_S / relaunch_watcher() in that file.
+    timeout-minutes: 350
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -79,9 +86,23 @@ jobs:
           # copy of the same ~14GB model.
           key: ollama-gpt-oss-20b-linux-v1
         continue-on-error: true
-      - name: Verify/pull GPT-OSS 20B
+      - name: Verify/pull GPT-OSS 20B and bake a full-context tag
         run: |
           ollama pull gpt-oss:20b
+          # Ollama's OpenAI-compatible endpoint can't set num_ctx per
+          # request, and its own default for gpt-oss is only 8192 (there's
+          # a known floor bug below that even when explicitly requested --
+          # see github.com/ollama/ollama/issues/11711). Baking num_ctx into
+          # a model tag via Modelfile is what actually gets gpt-oss:20b's
+          # real 128k window in use. This is a new manifest pointing at the
+          # same downloaded weight blobs, not a second copy of the model, so
+          # it doesn't meaningfully add to what actions/cache stores.
+          cat > /tmp/Modelfile.gptoss-max <<'EOF'
+          FROM gpt-oss:20b
+          PARAMETER num_ctx 131072
+          EOF
+          ollama create gpt-oss:20b-max -f /tmp/Modelfile.gptoss-max
+          ollama list
       - name: Save GPT-OSS Ollama cache
         if: steps.cache-ollama.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
@@ -105,6 +126,9 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
           RUNNER_SESSION_ID: ${{ inputs.session_id }}
+          GPTOSS_MODEL: gpt-oss:20b-max
+          GPTOSS_NUM_CTX: "131072"
+          JOB_TIMEOUT_MINUTES: "350"   # keep in sync with timeout-minutes above
           PYTHONUNBUFFERED: "1"
         run: |
           set -o pipefail

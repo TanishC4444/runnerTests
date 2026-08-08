@@ -12,6 +12,13 @@ on:
         description: Dashboard session identifier
         required: true
         type: string
+      resume_ref:
+        description: >
+          Internal: branch holding a checkpoint from a previous run of this
+          same task that ran out of time. Left blank for a normal, fresh
+          dispatch -- set automatically when this workflow relaunches itself.
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -26,6 +33,12 @@ concurrency:
 jobs:
   work:
     runs-on: ubuntu-latest
+    # 360 minutes is GitHub's hard cap on hosted runners -- not adjustable.
+    # 330 leaves headroom to finish the publish step before a force-kill.
+    # For tasks too large to finish in one window, runner_agent.py
+    # checkpoints its progress (messages + transcript) with time to spare
+    # and this workflow relaunches itself with resume_ref pointing at that
+    # checkpoint, so a single approved task can span many 6h windows.
     timeout-minutes: 330
     steps:
       - name: Free runner disk space
@@ -37,7 +50,11 @@ jobs:
       - name: Checkout approved base branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref_name }}
+          # A resumed run checks out its own checkpoint branch (which was
+          # itself branched from the original base, plus WIP changes and
+          # agent_output/checkpoint.json); a fresh run checks out the base
+          # branch normally.
+          ref: ${{ inputs.resume_ref != '' && inputs.resume_ref || github.ref_name }}
           fetch-depth: 0
 
       - name: Restore GPT-OSS Ollama cache
@@ -48,7 +65,7 @@ jobs:
           key: ollama-gpt-oss-20b-linux-v1
         continue-on-error: true
 
-      - name: Install and start Ollama
+      - name: Install and start Ollama, bake full-context tag
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
           nohup ollama serve > /tmp/ollama-agent.log 2>&1 &
@@ -57,6 +74,17 @@ jobs:
             sleep 1
           done
           ollama pull gpt-oss:20b
+          # Same reasoning as gptoss_watcher.yml: bake num_ctx into a tag
+          # since it can't be set through the OpenAI-compatible endpoint,
+          # and Ollama's own gpt-oss default (8192) is well short of the
+          # real 128k window. runner_agent.py already uses the native
+          # /api/chat endpoint and also passes num_ctx per-request, so this
+          # is belt-and-suspenders, not the only place it's set.
+          cat > /tmp/Modelfile.gptoss-max <<'EOF'
+          FROM gpt-oss:20b
+          PARAMETER num_ctx 131072
+          EOF
+          ollama create gpt-oss:20b-max -f /tmp/Modelfile.gptoss-max
           ollama list
 
       - name: Save GPT-OSS Ollama cache
@@ -79,7 +107,14 @@ jobs:
         env:
           AGENT_TASK: ${{ inputs.task }}
           AGENT_SESSION_ID: ${{ inputs.session_id }}
-          AGENT_MODEL: gpt-oss:20b
+          AGENT_MODEL: gpt-oss:20b-max
+          AGENT_NUM_CTX: "131072"
+          AGENT_RESUME_REF: ${{ inputs.resume_ref }}
+          # Budget this run to less than timeout-minutes so there's always
+          # time left to checkpoint, push, and (if needed) dispatch a
+          # continuation before GitHub force-kills the job. Deliberately not
+          # the whole 330 minutes.
+          AGENT_TIME_BUDGET_S: "14400"   # 240 minutes -- leaves headroom in the 330min job budget for setup (checkout, ollama install/pull), a possible near-timeout single-step generation (up to 3600s), and the publish/checkpoint step
           PYTHONUNBUFFERED: "1"
           # Optional: only set if you want the agent to be able to create new
           # repositories. GITHUB_TOKEN below is repo-scoped and can't do this
@@ -100,25 +135,65 @@ jobs:
           MCP_STATIC_TOKENS: ${{ secrets.MCP_STATIC_TOKENS }}
         run: python3 runner_agent.py
 
-      - name: Publish changes as a pull request
+      - name: Publish changes, or checkpoint and continue
         id: publish
         env:
           GH_TOKEN: ${{ github.token }}
+          RUNNER_PAT: ${{ secrets.RUNNER_PAT }}
           AGENT_BRANCH: agent/gpt-oss-${{ github.run_id }}
           SESSION_ID: ${{ inputs.session_id }}
+          BASE_REF: ${{ github.ref_name }}
+          ORIGINAL_TASK: ${{ inputs.task }}
         run: |
+          git config user.name "GPT-OSS Agent"
+          git config user.email "gpt-oss-agent@users.noreply.github.com"
+
+          if [ -f agent_output/CONTINUE ]; then
+            # runner_agent.py hit its time budget before finishing. Commit
+            # whatever WIP file changes plus the checkpoint (full message
+            # history + transcript) to a resume branch, then dispatch a new
+            # run of this same workflow pointed at that branch. No PR yet --
+            # this task isn't done.
+            echo "Task did not finish within this run's time budget; checkpointing."
+            git add --all
+            # agent_output/ is in .gitignore (its normal role is a per-run,
+            # artifact-uploaded scratch dir) -- force-add just the checkpoint
+            # files needed to resume, not the rest of that directory.
+            git add -f agent_output/checkpoint.json agent_output/CONTINUE
+            git commit -m "GPT-OSS checkpoint for $SESSION_ID (run ${{ github.run_id }})" --allow-empty
+            git push --set-upstream origin "$AGENT_BRANCH"
+
+            # Dispatching needs a token with `workflow` scope (or fine-grained
+            # Actions: write) -- the default github.token can trigger other
+            # workflows in limited cases but a PAT is the reliable path here.
+            # Reuses the same RUNNER_PAT already required elsewhere.
+            DISPATCH_TOKEN="${RUNNER_PAT:-$GH_TOKEN}"
+            curl -fsSL -X POST \
+              -H "Authorization: Bearer $DISPATCH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/agent_worker.yml/dispatches" \
+              -d "$(jq -n --arg ref "$BASE_REF" --arg task "$ORIGINAL_TASK" --arg session "$SESSION_ID" --arg resume "$AGENT_BRANCH" \
+                    '{ref:$ref, inputs:{task:$task, session_id:$session, resume_ref:$resume}}')"
+            echo "Continuation dispatched on branch $AGENT_BRANCH."
+            exit 0
+          fi
+
+          # A finished, resumed task may still have a checkpoint.json/CONTINUE
+          # from an earlier (unfinished) run committed on this branch's
+          # history -- drop them from the final tree so they don't show up
+          # as noise in the PR diff.
+          git rm -f --ignore-unmatch agent_output/checkpoint.json agent_output/CONTINUE >/dev/null 2>&1 || true
+
           if git diff --quiet && [ -z "$(git status --porcelain)" ]; then
             echo "No repository changes were produced."
             exit 0
           fi
-          git config user.name "GPT-OSS Agent"
-          git config user.email "gpt-oss-agent@users.noreply.github.com"
           git switch -c "$AGENT_BRANCH"
           git add --all
           git commit -m "GPT-OSS task for $SESSION_ID"
           git push --set-upstream origin "$AGENT_BRANCH"
           gh pr create \
-            --base "${{ github.ref_name }}" \
+            --base "$BASE_REF" \
             --head "$AGENT_BRANCH" \
             --title "GPT-OSS background task: $SESSION_ID" \
             --body-file agent_output/pull_request.md

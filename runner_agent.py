@@ -13,14 +13,35 @@ from pathlib import Path
 import requests
 
 
+# Defaults to the 8192-ctx base tag if the workflow didn't override it, but
+# agent_worker.yml sets this to gpt-oss:20b-max (num_ctx=131072 baked in via
+# Modelfile) plus AGENT_NUM_CTX below, sent per-request too.
 MODEL = os.environ.get("AGENT_MODEL", "gpt-oss:20b")
+NUM_CTX = int(os.environ.get("AGENT_NUM_CTX", "131072"))
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 TASK = os.environ.get("AGENT_TASK", "").strip()
 SESSION_ID = os.environ.get("AGENT_SESSION_ID", "dashboard")
 ROOT = Path.cwd().resolve()
 OUTPUT_DIR = ROOT / "agent_output"
-MAX_STEPS = 24
-MAX_FILE_BYTES = 512_000
+CHECKPOINT_FILE = OUTPUT_DIR / "checkpoint.json"
+CONTINUE_MARKER = OUTPUT_DIR / "CONTINUE"
+# Was a hard 24-step ceiling meant to bound worst-case cost/latency on a
+# metered path. That's no longer the real constraint -- the time budget
+# below is. Steps are cheap (one JSON action each); let a genuinely large
+# task use as many as it needs within its time budget instead of getting cut
+# off arbitrarily early.
+MAX_STEPS = 100000
+# Wall-clock budget for a single run of this script, independent of
+# timeout-minutes in the workflow (which is GitHub's hard, non-adjustable
+# cap). Leaving a run before the hard cap gives the "Publish changes, or
+# checkpoint and continue" workflow step time to actually commit/push/
+# dispatch before a force-kill would just drop that work on the floor.
+TIME_BUDGET_S = int(os.environ.get("AGENT_TIME_BUDGET_S", str(300 * 60)))
+RESUME_REF = os.environ.get("AGENT_RESUME_REF", "").strip()
+# Was 512KB, sized against a small per-completion token budget that couldn't
+# usefully write much more than that in one step anyway. Raised so writing a
+# genuinely large generated file isn't blocked by an arbitrary size cap.
+MAX_FILE_BYTES = 8_000_000
 GITHUB_API = "https://api.github.com"
 # The workflow's default GITHUB_TOKEN is repo-scoped and can never create a
 # new repository under the account -- that's an account-level permission.
@@ -108,10 +129,10 @@ def run_tool(action: dict, plan: dict) -> str:
     name = action.get("action")
     if name == "list_files":
         pattern = action.get("pattern", "*")
-        return "\n".join(str(path.relative_to(ROOT)) for path in sorted(ROOT.glob(pattern)) if path.is_file())[:30000]
+        return "\n".join(str(path.relative_to(ROOT)) for path in sorted(ROOT.glob(pattern)) if path.is_file())[:150000]
     if name == "read_file":
         path = safe_path(action["path"])
-        return path.read_text(encoding="utf-8")[:50000]
+        return path.read_text(encoding="utf-8")[:300000]
     if name == "write_file":
         path = safe_path(action["path"])
         content = action.get("content", "")
@@ -132,8 +153,8 @@ def run_tool(action: dict, plan: dict) -> str:
         ]
         if not any(re.fullmatch(pattern, command) for pattern in allowed):
             raise ValueError("command is outside the check allow-list")
-        completed = subprocess.run(command.split(), cwd=ROOT, capture_output=True, text=True, timeout=300)
-        return f"exit={completed.returncode}\n{completed.stdout[-20000:]}\n{completed.stderr[-10000:]}"
+        completed = subprocess.run(command.split(), cwd=ROOT, capture_output=True, text=True, timeout=1800)
+        return f"exit={completed.returncode}\n{completed.stdout[-100000:]}\n{completed.stderr[-50000:]}"
     if name == "create_repository":
         if not REPO_ADMIN_TOKEN:
             raise ValueError(
@@ -199,11 +220,20 @@ def extract_json(text: str) -> dict:
 
 
 def main():
-    if not TASK or len(TASK) > 55000:
-        sys.exit("AGENT_TASK must contain 1 to 55,000 characters")
+    # 55,000 chars was a conservative guess against a small context window.
+    # gpt-oss:20b's real ~128k token (~500k char) context leaves much more
+    # room for a genuinely large, detailed plan -- capped well under that so
+    # there's still room left for messages/tool results in the same context.
+    if not TASK or len(TASK) > 300000:
+        sys.exit("AGENT_TASK must contain 1 to 300,000 characters")
     plan = json.loads(TASK)
     plan_steps = len(plan.get("steps", []))
-    worker_token_budget = min(2400, max(1000, 900 + plan_steps * 140))
+    # Was capped at 2400 completion tokens per step to bound cost/latency
+    # under a metered path. Raised substantially now that the constraint is
+    # CPU generation speed against a time budget, not a token quota -- a
+    # step that legitimately needs to write a large file or reason through a
+    # complex diff can use the room.
+    worker_token_budget = min(24000, max(4000, 1500 * max(plan_steps, 1)))
 
     skill_text = "\n\n".join(
         f"### Skill: {s.get('title') or s.get('name')}\n{s.get('instructions', '')}"
@@ -242,13 +272,41 @@ def main():
         {"role": "user", "content": json.dumps({k: v for k, v in plan.items() if k not in ("skills", "mcp_tools", "mcp_servers")})},
     ]
     transcript = []
+    step_offset = 0
+
+    # Resume from a previous run's checkpoint if agent_worker.yml checked one
+    # out (resume_ref set + checkpoint.json present on that branch). Replaces
+    # the freshly-built messages/transcript above with where the prior run
+    # left off, so this run continues the same conversation instead of
+    # restarting the task from scratch.
+    if RESUME_REF and CHECKPOINT_FILE.exists():
+        checkpoint = json.loads(CHECKPOINT_FILE.read_text(encoding="utf-8"))
+        messages = checkpoint["messages"]
+        transcript = checkpoint["transcript"]
+        step_offset = checkpoint["steps_used"]
+        print(f"[resume] loaded checkpoint from {RESUME_REF}: {step_offset} steps already used", flush=True)
+
     started = time.time()
     final = None
-    for step in range(1, MAX_STEPS + 1):
+    ran_out_of_time = False
+    for step in range(step_offset + 1, step_offset + MAX_STEPS + 1):
+        if time.time() - started > TIME_BUDGET_S:
+            print(f"[checkpoint] time budget ({TIME_BUDGET_S}s) reached after {step - 1} steps this run; "
+                  f"checkpointing for continuation instead of pushing further.", flush=True)
+            ran_out_of_time = True
+            break
         response = requests.post(
             OLLAMA_URL.rstrip("/") + "/api/chat",
-            json={"model": MODEL, "messages": messages, "stream": False, "options": {"num_predict": worker_token_budget, "temperature": 0.2}},
-            timeout=900,
+            json={
+                "model": MODEL,
+                "messages": messages,
+                "stream": False,
+                "options": {"num_predict": worker_token_budget, "temperature": 0.2, "num_ctx": NUM_CTX},
+            },
+            # Raised from 900s: at full 128k context with a large
+            # worker_token_budget, CPU-only generation can fall to ~9 tok/s,
+            # so a single step's completion can legitimately take a while.
+            timeout=3600,
         )
         if not response.ok:
             raise RuntimeError(f"Ollama HTTP {response.status_code}: {response.text[:1000]}")
@@ -265,9 +323,27 @@ def main():
             observation = f"TOOL ERROR: {error}"
         transcript[-1]["observation"] = observation
         messages.append({"role": "user", "content": f"Tool result:\n{observation}"})
+
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+    if ran_out_of_time and final is None:
+        # Not done -- write a checkpoint instead of a result/PR body.
+        # agent_worker.yml's publish step looks for CONTINUE_MARKER and, if
+        # present, commits this checkpoint to a resume branch and dispatches
+        # a fresh run of this workflow pointed at it instead of opening a PR.
+        checkpoint = {
+            "session_id": SESSION_ID,
+            "messages": messages,
+            "transcript": transcript,
+            "steps_used": len(transcript),
+        }
+        CHECKPOINT_FILE.write_text(json.dumps(checkpoint, indent=2), encoding="utf-8")
+        CONTINUE_MARKER.write_text("continue\n", encoding="utf-8")
+        print(f"Checkpointed after {len(transcript)} total steps; a continuation run will be dispatched.")
+        return
+
     if final is None:
         final = {"summary": "Worker reached its step limit.", "tests": [], "risks": ["Manual review required"]}
-    OUTPUT_DIR.mkdir(exist_ok=True)
     result = {"session_id": SESSION_ID, "model": MODEL, "plan": plan, "final": final, "steps_used": len(transcript), "duration_seconds": round(time.time() - started, 2)}
     (OUTPUT_DIR / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     (OUTPUT_DIR / "transcript.json").write_text(json.dumps(transcript, indent=2), encoding="utf-8")
